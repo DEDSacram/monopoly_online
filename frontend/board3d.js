@@ -66,7 +66,8 @@ export function initBoard3D(container) {
   container.appendChild(renderer.domElement);
 
   scene = new THREE.Scene();
-  scene.background = new THREE.Color(0x0f172a);
+  scene.background = new THREE.Color(0x140c07); // warm tavern dark
+  scene.fog = new THREE.Fog(0x140c07, 26, 70);
 
   camera = new THREE.PerspectiveCamera(50, 1, 0.1, 200);
   camera.position.set(CAM_POS.x - 5, CAM_POS.y + 5, CAM_POS.z - 5); // intro start
@@ -88,8 +89,8 @@ export function initBoard3D(container) {
   rosterGroup = new THREE.Group();
   uiRoot.add(hudGroup, dlgGroup, rosterGroup);
 
-  scene.add(new THREE.HemisphereLight(0xffffff, 0x334155, 0.95));
-  const sun = new THREE.DirectionalLight(0xffffff, 1.6);
+  scene.add(new THREE.HemisphereLight(0xffe2b8, 0x40260f, 0.55));
+  const sun = new THREE.DirectionalLight(0xffd9a8, 1.15);
   sun.position.set(6, 14, 3);
   sun.castShadow = true;
   sun.shadow.mapSize.set(2048, 2048);
@@ -118,22 +119,56 @@ export function initBoard3D(container) {
     pole: new THREE.MeshStandardMaterial({ color: 0xcbd5e1, roughness: 0.5 }),
   });
 
-  // base slab + ground
+  // ---- tavern: wooden table with green baize inlay, plank floor ----
+  const tableTex = woodTexture('#6b4423', '#452811');
+  tableTex.wrapS = tableTex.wrapT = THREE.RepeatWrapping;
+  tableTex.repeat.set(3, 3);
+  const table = new THREE.Mesh(
+    new THREE.BoxGeometry(14, 0.5, 14),
+    new THREE.MeshStandardMaterial({map: tableTex, roughness: 0.7})
+  );
+  table.position.y = -0.45; // top surface at y=-0.2
+  table.receiveShadow = true;
+  scene.add(table);
+  const legMat = new THREE.MeshStandardMaterial({color: 0x3d2410, roughness: 0.85});
+  for (const [lx, lz] of [[-6, -6], [6, -6], [-6, 6], [6, 6]]) {
+    const leg = new THREE.Mesh(new THREE.BoxGeometry(0.7, 5.3, 0.7), legMat);
+    leg.position.set(lx, -3.35, lz);
+    scene.add(leg);
+  }
+  // green baize playing surface the board sits on
   const slab = new THREE.Mesh(
     new THREE.BoxGeometry(8 * PITCH + 0.7, 0.2, 8 * PITCH + 0.7),
-    new THREE.MeshStandardMaterial({ color: 0x14532d, roughness: 0.9 })
+    new THREE.MeshStandardMaterial({color: 0x14532d, roughness: 0.9})
   );
   slab.position.y = -0.1;
   slab.receiveShadow = true;
   scene.add(slab);
+  const floorTex = woodTexture('#4a2f18', '#2a1a0c');
+  floorTex.wrapS = floorTex.wrapT = THREE.RepeatWrapping;
+  floorTex.repeat.set(12, 12);
   const ground = new THREE.Mesh(
-    new THREE.PlaneGeometry(80, 80),
-    new THREE.MeshStandardMaterial({ color: 0x020617, roughness: 1 })
+    new THREE.PlaneGeometry(90, 90),
+    new THREE.MeshStandardMaterial({map: floorTex, roughness: 0.95})
   );
   ground.rotation.x = -Math.PI / 2;
-  ground.position.y = -0.21;
+  ground.position.y = -6;
   ground.receiveShadow = true;
   scene.add(ground);
+
+  // candle clusters on the table corners (2 real lights, 4x flames)
+  candleCluster(-5.6, -5.6, true);
+  candleCluster(5.6, -5.6, true);
+  candleCluster(-5.6, 5.6, false);
+  candleCluster(5.6, 5.6, false);
+  // fireplace glow from the west side
+  buildFireplace();
+  // barrels + beer mugs for atmosphere
+  barrel(9.5, -9, 1.2);
+  barrel(11, -7.2, 0.9);
+  barrel(-10, 8.5, 1.1);
+  mug(6.3, 2.5);
+  mug(-2.5, 6.3);
 
   // tiles
   raycaster = new THREE.Raycaster();
@@ -233,6 +268,17 @@ export function initBoard3D(container) {
 
   renderer.setAnimationLoop(() => {
     stepTweens();
+    // candle + fireplace flicker
+    const ft = performance.now() / 1000;
+    for (const f of flickers) {
+      if (f.light) {
+        f.light.intensity = f.base
+          + Math.sin(ft * f.speed) * f.amp * 0.35
+          + Math.sin(ft * f.speed * 2.7 + 1.3) * f.amp * 0.2;
+      }
+      const fs = 1 + 0.1 * Math.sin(ft * 11 + f.speed) + 0.05 * Math.sin(ft * 23 + f.speed * 2);
+      for (const fl of f.flames) fl.s.scale.set(fl.bx * fs, fl.by * (2 - fs), 1);
+    }
     if (targeting) { // pulse all flyable tiles
       const k = 0.35 + 0.3 * Math.sin(performance.now() / 240);
       tileMeshes.forEach((t, i) => {
@@ -474,6 +520,163 @@ function centerTexture(state) {
 }
 
 // ---------- state rendering ----------
+
+const flickers = []; // candle/fireplace flicker: {light, base, amp, speed, flames:[{s,bx,by}]}
+
+function woodTexture(base, dark) {
+  return canvasTex(512, (ctx, S) => {
+    ctx.fillStyle = base;
+    ctx.fillRect(0, 0, S, S);
+    const rows = 6;
+    for (let r = 0; r < rows; r++) {
+      const y = (r * S) / rows;
+      ctx.fillStyle = Math.random() < 0.5 ? 'rgba(255,220,170,0.05)' : 'rgba(0,0,0,0.08)';
+      ctx.fillRect(0, y, S, S / rows);
+      for (let gl = 0; gl < 14; gl++) {
+        ctx.strokeStyle = `rgba(30,15,5,${0.1 + Math.random() * 0.15})`;
+        ctx.lineWidth = 1 + Math.random() * 2;
+        ctx.beginPath();
+        const gy = y + Math.random() * S / rows;
+        ctx.moveTo(0, gy);
+        for (let x = 0; x <= S; x += 32) ctx.lineTo(x, gy + Math.sin(x * 0.02 + gl) * 3 + (Math.random() - 0.5) * 3);
+        ctx.stroke();
+      }
+      ctx.fillStyle = dark;
+      ctx.globalAlpha = 0.55;
+      ctx.fillRect(0, y, S, 3);
+      ctx.globalAlpha = 1;
+    }
+  });
+}
+
+let _flameTex = null;
+function flameTexture() {
+  if (_flameTex) return _flameTex;
+  _flameTex = canvasTex(128, (ctx, S) => {
+    const g = ctx.createRadialGradient(S / 2, S * 0.62, 4, S / 2, S * 0.55, S * 0.5);
+    g.addColorStop(0, 'rgba(255,240,200,1)');
+    g.addColorStop(0.35, 'rgba(255,180,80,0.9)');
+    g.addColorStop(0.7, 'rgba(230,90,20,0.45)');
+    g.addColorStop(1, 'rgba(120,30,0,0)');
+    ctx.fillStyle = g;
+    ctx.fillRect(0, 0, S, S);
+  });
+  return _flameTex;
+}
+
+function flameSprite(bx, by) {
+  const f = new THREE.Sprite(new THREE.SpriteMaterial({
+    map: flameTexture(), transparent: true, blending: THREE.AdditiveBlending, depthWrite: false,
+  }));
+  f.scale.set(bx, by, 1);
+  f.renderOrder = 5;
+  return {s: f, bx, by};
+}
+
+function candleCluster(x, z, withLight) {
+  const grp = new THREE.Group();
+  const brass = new THREE.MeshStandardMaterial({color: 0x8a6d2f, metalness: 0.7, roughness: 0.35});
+  const wax = new THREE.MeshStandardMaterial({color: 0xf3e5c3, roughness: 0.6});
+  const tray = new THREE.Mesh(new THREE.CylinderGeometry(0.5, 0.55, 0.08, 20), brass);
+  tray.position.y = 0.04;
+  grp.add(tray);
+  const entry = {light: null, base: 0, amp: 0, speed: 9 + Math.random() * 4, flames: []};
+  [0.5, 0.78, 0.36].forEach((h, i) => {
+    const a = (i / 3) * Math.PI * 2;
+    const cx = Math.cos(a) * 0.2, cz = Math.sin(a) * 0.2;
+    const c = new THREE.Mesh(new THREE.CylinderGeometry(0.09, 0.1, h, 12), wax);
+    c.position.set(cx, 0.08 + h / 2, cz);
+    c.castShadow = true;
+    grp.add(c);
+    const fl = flameSprite(0.28, 0.42);
+    fl.s.position.set(cx, 0.08 + h + 0.18, cz);
+    grp.add(fl.s);
+    entry.flames.push(fl);
+  });
+  if (withLight) {
+    const pl = new THREE.PointLight(0xff9a3c, 14, 14, 2);
+    pl.position.set(0, 1.4, 0);
+    grp.add(pl);
+    entry.light = pl;
+    entry.base = 14;
+    entry.amp = 3.5;
+  }
+  flickers.push(entry);
+  grp.position.set(x, -0.2, z); // on the table top
+  scene.add(grp);
+}
+
+function buildFireplace() {
+  const g = new THREE.Group();
+  const stone = new THREE.MeshStandardMaterial({color: 0x3b3b42, roughness: 0.95});
+  const base = new THREE.Mesh(new THREE.BoxGeometry(2.2, 1.4, 5.5), stone);
+  base.position.y = 0.7;
+  const hood = new THREE.Mesh(new THREE.BoxGeometry(1.6, 7.5, 4.2), stone);
+  hood.position.y = 1.4 + 3.75;
+  const mantel = new THREE.Mesh(new THREE.BoxGeometry(2.5, 0.35, 5.8), stone);
+  mantel.position.y = 2.6;
+  const fireMat = new THREE.MeshBasicMaterial({color: 0xff7a1e});
+  const fire = new THREE.Mesh(new THREE.PlaneGeometry(3.2, 1.5), fireMat);
+  fire.rotation.y = Math.PI / 2;
+  fire.position.set(1.12, 0.9, 0);
+  const logMat = new THREE.MeshStandardMaterial({color: 0x2a1608, roughness: 1});
+  const log1 = new THREE.Mesh(new THREE.CylinderGeometry(0.16, 0.16, 2.6, 8), logMat);
+  log1.rotation.x = Math.PI / 2;
+  log1.position.set(0.7, 0.25, 0.3);
+  const log2 = log1.clone();
+  log2.position.set(0.7, 0.25, -0.4);
+  g.add(base, hood, mantel, fire, log1, log2);
+  const flames = [];
+  for (const [fz, bx, by] of [[-0.5, 0.9, 1.2], [0.4, 1.1, 1.5]]) {
+    const fl = flameSprite(bx, by);
+    fl.s.position.set(0.75, 1.0, fz);
+    g.add(fl.s);
+    flames.push(fl);
+  }
+  const pl = new THREE.PointLight(0xff6a1a, 60, 42, 2);
+  pl.position.set(3, 1.5, 0);
+  g.add(pl);
+  flickers.push({light: pl, base: 60, amp: 18, speed: 7, flames});
+  g.position.set(-16, -6, 0); // on the floor, west side
+  g.traverse(o => { if (o.isMesh) o.castShadow = true; });
+  scene.add(g);
+}
+
+function barrel(x, z, s = 1) {
+  const bmat = new THREE.MeshStandardMaterial({color: 0x6b4423, roughness: 0.8});
+  const b = new THREE.Mesh(new THREE.CylinderGeometry(0.9 * s, 0.75 * s, 1.6 * s, 18), bmat);
+  b.position.set(x, -6 + 0.8 * s, z);
+  b.castShadow = true;
+  scene.add(b);
+  const bandMat = new THREE.MeshStandardMaterial({color: 0x222226, metalness: 0.6, roughness: 0.5});
+  for (const by of [-0.5, 0.5]) {
+    const band = new THREE.Mesh(new THREE.TorusGeometry(0.87 * s, 0.05, 8, 24), bandMat);
+    band.rotation.x = Math.PI / 2;
+    band.position.set(x, -6 + 0.8 * s + by * s, z);
+    scene.add(band);
+  }
+}
+
+function mug(x, z) {
+  const g = new THREE.Group();
+  const wood = new THREE.MeshStandardMaterial({color: 0x7a4a1e, roughness: 0.7});
+  const body = new THREE.Mesh(new THREE.CylinderGeometry(0.28, 0.24, 0.55, 16), wood);
+  body.position.y = 0.275;
+  body.castShadow = true;
+  g.add(body);
+  const handle = new THREE.Mesh(new THREE.TorusGeometry(0.18, 0.05, 8, 16, Math.PI), wood);
+  handle.position.set(0.28, 0.3, 0);
+  handle.rotation.z = -Math.PI / 2;
+  g.add(handle);
+  const foam = new THREE.Mesh(
+    new THREE.CylinderGeometry(0.26, 0.26, 0.1, 16),
+    new THREE.MeshStandardMaterial({color: 0xf5ead0, roughness: 0.9})
+  );
+  foam.position.y = 0.58;
+  g.add(foam);
+  g.position.set(x, -0.2, z); // on the table top
+  scene.add(g);
+}
 function seatPos(tileIdx, seat) {
   const { x, z } = tileXZ(tileIdx);
   return new THREE.Vector3(x + SEAT_OFF[seat % 4][0], TILE_TOP, z + SEAT_OFF[seat % 4][1]);

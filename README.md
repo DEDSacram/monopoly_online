@@ -5,6 +5,9 @@ Up to 4 players roll dice to navigate a square board of cities + specials.
 and animates tokens from the server's `{dice, oldPos, newPos, events}` response.
 
 ## 3D board (Three.js, vendored locally)
+- The game plays out on a green baize in a **tavern**: wooden table + legs,
+  plank floor, flickering candle clusters, a stone fireplace glowing from the
+  west, barrels and beer mugs — all procedural, no assets.
 - `frontend/board3d.js` renders all 28 tiles as 3D blocks around a square,
   with canvas-texture labels (name, price, rent, houses/hotel, boosts, owner),
   pawn tokens, house/hotel meshes, boost stars, owner flags, center logo slab.
