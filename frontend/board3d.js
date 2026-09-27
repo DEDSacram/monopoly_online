@@ -22,6 +22,8 @@ const SEAT_OFF = [[-0.26, -0.26], [0.26, -0.26], [-0.26, 0.26], [0.26, 0.26]];
 let renderer, scene, camera, controls, raycaster;
 let tileMeshes = [];      // per-tile {mesh, topMat}
 let markerGroups = [];    // per-tile THREE.Group (houses/hotel/boost/flag/label)
+let plateSprites = [];    // per-tile label sprite (toggleable with panels)
+let panelsVisible = true; // floating panels (plates, roster, name tags) toggle
 let tokenMeshes = [];     // per seat index
 let tokenTags = [];       // floating name sprites, one per seat
 let turnRing = null;      // pulsing marker under the current player's token
@@ -242,8 +244,8 @@ export function initBoard3D(container) {
     // name tags ride their tokens (even mid-hop); turn ring pulses under current
     for (let s = 0; s < tokenMeshes.length; s++) {
       const tk = tokenMeshes[s], tag = tokenTags[s];
-      tag.visible = tk.visible;
-      if (tk.visible) tag.position.set(tk.position.x, tk.position.y + 1.0, tk.position.z);
+      tag.visible = tk.visible && panelsVisible;
+      if (tag.visible) tag.position.set(tk.position.x, tk.position.y + 1.0, tk.position.z);
     }
     if (turnRing) {
       const tk = tokenMeshes[currentSeat];
@@ -506,7 +508,7 @@ export function renderBoard3D(state) {
       tileMeshes[t.index].topMat.needsUpdate = true;
       if (old) old.dispose();
       const mg = markerGroups[t.index];
-      mg.children.forEach(m => { // sprites own unique textures: free them
+      mg.children.forEach(m => { // label sprites own unique textures: free them
         if (m.isSprite) { if (m.material.map) m.material.map.dispose(); m.material.dispose(); }
       });
       clearGroup(mg);
@@ -537,7 +539,10 @@ export function renderBoard3D(state) {
         flag.position.set(x + 0.4, TILE_TOP + 0.58, z + 0.4);
         mg.add(pole, flag);
       }
-      mg.add(labelSprite(t, owner)); // camera-facing name plate
+      const plate = labelSprite(t, owner); // camera-facing name plate
+      plate.visible = panelsVisible;
+      mg.add(plate);
+      plateSprites[t.index] = plate;
     });
   }
   const csig = `${state.round}|${state.hotelUnlockRound}|${state.constants.resortTiles.join(',')}`;
@@ -680,8 +685,35 @@ export async function showDice3D(d1, d2) {
     });
   });
   await Promise.all(jobs);
+  showSum3D(d1, d2); // short-lived floating total once the dice settle
   await wait(900);
   diceMeshes.forEach(m => { m.visible = false; });
+}
+
+// Short-lived floating dice total ("7", gold + DOUBLES! on doubles).
+// Rides the existing floaters pipeline: rises, fades, disposes itself.
+function showSum3D(d1, d2) {
+  if (!ready) return;
+  const sum = d1 + d2, dbl = d1 === d2;
+  const tex = rectTex(512, 256, (ctx, W, H) => {
+    ctx.clearRect(0, 0, W, H);
+    ctx.textAlign = 'center';
+    ctx.font = 'bold 150px system-ui,sans-serif';
+    ctx.lineWidth = 14;
+    ctx.strokeStyle = 'rgba(2,6,23,0.9)';
+    ctx.strokeText(`${sum}`, W / 2, 158);
+    ctx.fillStyle = dbl ? '#fbbf24' : '#ffffff';
+    ctx.fillText(`${sum}`, W / 2, 158);
+    ctx.font = 'bold 44px system-ui,sans-serif';
+    ctx.fillStyle = '#cbd5e1';
+    ctx.fillText(dbl ? 'DOUBLES!' : 'total', W / 2, 218);
+  });
+  const sp = new THREE.Sprite(new THREE.SpriteMaterial({map: tex, transparent: true, depthTest: false}));
+  sp.scale.set(2.2, 1.1, 1);
+  sp.renderOrder = 1002;
+  sp.position.set(0, 1.1, UI_Z);
+  uiRoot.add(sp);
+  floaters.push({sprite: sp, seat: -1, y0: 1.1, start: performance.now(), dur: 1300});
 }
 
 // ================= in-3D UI: HUD action bar + modal dialogs =================
@@ -909,6 +941,13 @@ function spawnMoneyFx(seat, delta) {
   uiRoot.add(sp);
   floaters.push({sprite: sp, seat, y0: sp.position.y, start: performance.now(), dur: 1400});
   moneyFx.push({seat, tint: gain ? 0x4ade80 : 0xf87171, start: performance.now()});
+}
+
+export function setPanelsVisible3D(v) {
+  panelsVisible = v;
+  if (!ready) return;
+  if (rosterGroup) rosterGroup.visible = v;
+  for (const sp of plateSprites) if (sp) sp.visible = v;
 }
 
 function layoutRoster() {

@@ -4,12 +4,26 @@ import {
   initBoard3D, renderBoard3D, animateSteps3D, animateFly3D,
   showDice3D, resetView3D, onTileClick3D, resize3D,
   updateHUD3D, onHUDClick3D, openDialog3D, openDicePick3D,
-  setTargeting3D, isDialogOpen3D,
+  setTargeting3D, isDialogOpen3D, setPanelsVisible3D,
 } from './board3d.js';
 
 let G = null, gameId = null, playerId = null, ws = null;
 let boardReady = false;
 let flyTargeting = false;
+let panelsOn = true;
+
+function togglePanels() {
+  if (!boardReady) return;
+  panelsOn = !panelsOn;
+  setPanelsVisible3D(panelsOn);
+  $("hint").textContent = panelsOn ? "floating panels on" : "floating panels off (clean board)";
+  updateHUD3D(hudDefs());
+}
+document.addEventListener("keydown", e => {
+  const tag = (e.target && e.target.tagName) || "";
+  if (tag === "INPUT" || tag === "SELECT" || tag === "TEXTAREA") return; // don't hijack typing
+  if ((e.key === "h" || e.key === "H") && boardReady) togglePanels();
+});
 const $ = id => document.getElementById(id);
 const api = (m, u, b) => fetch(u, {method: m, headers: {"Content-Type": "application/json"}, body: b ? JSON.stringify(b) : undefined}).then(async r => {
   const j = await r.json().catch(() => ({}));
@@ -141,6 +155,7 @@ async function onHUD(id) {
         break;
       case "view": resetView3D(); break;
       case "timer": timerDialog3D(); break;
+      case "panels": togglePanels(); break;
     }
   } catch (e) { $("hint").textContent = e.message; }
 }
@@ -184,6 +199,7 @@ function hudDefs() {
     if (cur && cur.hasRolled) d.push({id: "end", label: "End ⏭"});
   }
   d.push({id: "timer", label: "⏱"});
+  d.push({id: "panels", label: "👁", sub: panelsOn ? "panels on" : "panels off"});
   d.push({id: "view", label: "📷"});
   return d;
 }
@@ -235,23 +251,6 @@ function describe(e) {
     case "bankrupt": return "BANKRUPT!";
     default: return e.type;
   }
-}
-
-// ---- 3D dialogs (all modal popups live in the scene) ----
-
-// Dice result dialog: shown right after the throw, token moves on Continue.
-async function diceDialog3D(res) {
-  const [d1, d2] = res.dice;
-  const tile = res.state.board[res.newPos];
-  await openDialog3D({
-    title: "🎲 You rolled",
-    big: `${DICE_FACES[d1]} ${DICE_FACES[d2]}`,
-    lines: [
-      `total ${d1 + d2}${d1 === d2 ? " · doubles!" : ""} → ${tile.name} (tile ${res.newPos})`,
-      ...res.events.map(describe).slice(0, 4),
-    ],
-    options: [{id: "go", label: "▶ Move token"}],
-  });
 }
 
 const LEVEL_LABEL = ["Land only", "House Lv1", "Houses Lv2", "Houses Lv3", "🏨 HOTEL"];
@@ -361,8 +360,7 @@ async function maybeGameOverDialog3D(state) {
 async function animateMove(res) {
   const [d1, d2] = res.dice;
   $("dice").textContent = `${DICE_FACES[d1]} ${DICE_FACES[d2]} (${d1 + d2})`;
-  await diceDialog3D(res); // 3D result dialog first, move plays on Continue
-  // 3D dice toss + token hop along the travelled path
+  // straight into the 3D dice toss + token hop — no gate dialog
   const seat = seatOf(res.state, playerId);
   let pos = res.oldPos;
   const steps = (res.newPos - pos + N) % N || (res.events.some(e => e.type === "passed_go") ? N : 0);
