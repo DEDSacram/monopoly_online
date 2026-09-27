@@ -19,7 +19,8 @@ and animates tokens from the server's `{dice, oldPos, newPos, events}` response.
 - Chunky glowing pawns with floating **name tags**, tile plates pushed outward
   so tokens stay visible, and a pulsing gold **ring under the current player**.
 - Corner **roster overlay** in the scene (seats → TL/TR/BL/BR): name, cash,
-  net worth, status icons, gold border on whose turn it is.
+  net worth, status icons, gold border on whose turn it is — every cash change
+  pops the panel green/red with a rising `+$200` / `-$50` ticker.
 - Rolls play a 3D dice toss (correct pips face up) + token hop per tile;
   World Tour flights arc through the air. Clicking a tile inspects it and
   pre-fills the fly-target box. Three.js r160 is vendored under

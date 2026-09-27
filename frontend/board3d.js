@@ -239,7 +239,7 @@ export function initBoard3D(container) {
         t.topMat.emissiveIntensity = k;
       });
     }
-    // name tags ride their tokens (even mid-hop); turn ring pulses below #current
+    // name tags ride their tokens (even mid-hop); turn ring pulses under current
     for (let s = 0; s < tokenMeshes.length; s++) {
       const tk = tokenMeshes[s], tag = tokenTags[s];
       tag.visible = tk.visible;
@@ -253,6 +253,33 @@ export function initBoard3D(container) {
         turnRing.material.opacity = 0.55 + 0.35 * Math.sin(performance.now() / 300);
       }
     }
+    // money eye candy: panel flash+pop, then rising +/- tickers
+    const nowFx = performance.now();
+    moneyFx = moneyFx.filter(fx => {
+      const k = (nowFx - fx.start) / 700;
+      const m = rosterPanels.find(r => r.seat === fx.seat);
+      if (k >= 1) {
+        if (m) { m.mesh.material.color.setHex(0xffffff); m.mesh.scale.setScalar(1); }
+        return false;
+      }
+      if (m) {
+        m.mesh.material.color.setHex(fx.tint).lerp(WHITE_TMP, k);
+        m.mesh.scale.setScalar(1 + 0.12 * Math.sin(Math.PI * Math.min(1, k * 1.6)));
+      }
+      return true;
+    });
+    floaters = floaters.filter(f => {
+      const k = (nowFx - f.start) / f.dur;
+      if (k >= 1) {
+        if (f.sprite.parent) f.sprite.parent.remove(f.sprite);
+        f.sprite.material.map.dispose();
+        f.sprite.material.dispose();
+        return false;
+      }
+      f.sprite.position.y = f.y0 + k * 0.9;
+      f.sprite.material.opacity = k < 0.55 ? 1 : 1 - (k - 0.55) / 0.45;
+      return true;
+    });
     controls.update();
     renderer.render(scene, camera);
   });
@@ -667,6 +694,11 @@ let rosterPanels = [];        // {mesh, seat}
 let rosterSig = '';
 let rosterCount = 0;
 let hudY = -2.62;
+let rosterGameId = null;
+let rosterMoney = [null, null, null, null]; // last seen cash per seat
+let moneyFx = [];             // panel flash+pop: {seat, tint, start}
+let floaters = [];            // rising delta tickers: {sprite, seat, y0, start, dur}
+const WHITE_TMP = new THREE.Color(0xffffff);
 let hudBtns = [];           // {id, mesh, enabled}
 let dlgBtns = [];           // {id, mesh, enabled}
 let dlgResolve = null;
@@ -809,6 +841,16 @@ function rosterTexture(p, isCurrent, mode) {
 }
 
 function updateRoster3D(state) {
+  if (state.id !== rosterGameId) { // fresh game: learn balances silently
+    rosterGameId = state.id;
+    rosterMoney = state.players.map(p => p.money);
+  }
+  // detect cash deltas BEFORE the texture rebuild below
+  const deltas = state.players.map((p, s) => {
+    const old = rosterMoney[s];
+    rosterMoney[s] = p.money;
+    return (old === null || old === undefined || old === p.money) ? 0 : p.money - old;
+  });
   const sig = JSON.stringify(state.players.map(p =>
     [p.name, p.color, p.money, p.netWorth, p.bankrupt, p.inJail, p.tourPending, p.team,
      state.currentPlayerId === p.id, state.mode]));
@@ -838,6 +880,35 @@ function updateRoster3D(state) {
   hudY = rosterCount > 2 ? -1.85 : -2.62; // lift HUD when bottom corners are taken
   layoutRoster();
   layoutHUD();
+  // eye candy: flash+pop the panel and float a +/- ticker for every change
+  deltas.forEach((d, s) => { if (d !== 0) spawnMoneyFx(s, d); });
+}
+
+// Rising "+$200" / "-$50" ticker anchored to a roster panel, plus panel flash+pop.
+function spawnMoneyFx(seat, delta) {
+  if (!ready) return;
+  const panel = rosterPanels.find(r => r.seat === seat);
+  const gain = delta > 0;
+  const tex = rectTex(512, 128, (ctx, W, H) => {
+    ctx.clearRect(0, 0, W, H);
+    ctx.textAlign = 'center';
+    ctx.font = 'bold 84px system-ui,sans-serif';
+    const s = `${gain ? '+' : ''}$${delta}`;
+    ctx.lineWidth = 12;
+    ctx.strokeStyle = 'rgba(2,6,23,0.9)';
+    ctx.strokeText(s, W / 2, 94);
+    ctx.fillStyle = gain ? '#4ade80' : '#f87171';
+    ctx.fillText(s, W / 2, 94);
+  });
+  const sp = new THREE.Sprite(new THREE.SpriteMaterial({map: tex, transparent: true, depthTest: false}));
+  sp.scale.set(1.7, 1.7 * 128 / 512, 1);
+  sp.renderOrder = 1001;
+  const stack = floaters.filter(f => f.seat === seat).length;
+  const base = panel ? panel.mesh.position : new THREE.Vector3(0, 2.2, UI_Z);
+  sp.position.set(base.x, base.y + 0.75 + stack * 0.4, UI_Z);
+  uiRoot.add(sp);
+  floaters.push({sprite: sp, seat, y0: sp.position.y, start: performance.now(), dur: 1400});
+  moneyFx.push({seat, tint: gain ? 0x4ade80 : 0xf87171, start: performance.now()});
 }
 
 function layoutRoster() {
