@@ -390,33 +390,59 @@ function tileTexture(t, owner) {
   const band = t.type === "property"
     ? '#' + GROUP_COLORS[t.group].toString(16).padStart(6, '0')
     : '#' + (SPECIAL_COLORS[t.type] ?? 0x64748b).toString(16).padStart(6, '0');
-  // flat top keeps only big at-a-glance facts; the name lives on the
-  // camera-facing sprite (always readable, incl. from the Start corner)
-  return canvasTex(256, (ctx, S) => {
-    ctx.fillStyle = '#f1f5f9';
+  // 512px canvas + oversized bold type: stays legible at glancing angles,
+  // and carries the name so tiles read with plates toggled off
+  return canvasTex(512, (ctx, S) => {
+    ctx.fillStyle = '#f8fafc';
     ctx.fillRect(0, 0, S, S);
     ctx.fillStyle = band;
-    ctx.fillRect(0, 0, S, 58);
+    ctx.fillRect(0, 0, S, 110);
     ctx.fillStyle = '#fff';
-    ctx.font = 'bold 34px system-ui,sans-serif';
-    ctx.fillText(`${t.index}`, 12, 41);
+    ctx.font = 'bold 64px system-ui,sans-serif';
+    ctx.fillText(`${t.index}`, 24, 80);
     ctx.textAlign = 'right';
-    ctx.fillText(`S${t.side}`, S - 12, 41);
+    ctx.fillText(`S${t.side}`, S - 24, 80);
     ctx.textAlign = 'left';
     ctx.fillStyle = '#0f172a';
-    ctx.font = 'bold 34px system-ui,sans-serif';
-    let y = 116;
-    if (t.price) { ctx.fillText(`$${t.price}`, 12, y); y += 44; }
-    if (t.rent != null) {
-      ctx.fillStyle = '#b45309';
-      ctx.fillText(`rent $${t.rent}`, 12, y);
+    ctx.font = 'bold 54px system-ui,sans-serif';
+    const words = t.name.split(' ');
+    const lines = [];
+    let cur = '';
+    for (const w of words) {
+      if ((cur + ' ' + w).trim().length > 10) { lines.push(cur.trim()); cur = w; }
+      else cur += ' ' + w;
+    }
+    lines.push(cur.trim());
+    lines.slice(0, 2).forEach((ln, k) => ctx.fillText(ln, 24, 185 + k * 62));
+    let y = 330;
+    if (t.type === 'property') {
+      ctx.fillStyle = '#15803d';
+      ctx.font = 'bold 62px system-ui,sans-serif';
+      if (t.price) { ctx.fillText(`$${t.price}`, 24, y); y += 72; }
+      if (t.rent != null) {
+        ctx.fillStyle = '#b45309';
+        ctx.fillText(`rent $${t.rent}`, 24, y);
+      }
+    } else {
+      ctx.fillStyle = '#334155';
+      ctx.font = 'bold 46px system-ui,sans-serif';
+      const label = TYPE_SHORT[t.type] || t.type;
+      const w2 = label.split(' ');
+      const l2 = [];
+      let c2 = '';
+      for (const w of w2) {
+        if ((c2 + ' ' + w).trim().length > 12) { l2.push(c2.trim()); c2 = w; }
+        else c2 += ' ' + w;
+      }
+      l2.push(c2.trim());
+      l2.slice(0, 2).forEach((ln, k) => ctx.fillText(ln, 24, 330 + k * 56));
     }
     if (owner) {
       ctx.fillStyle = owner.color;
-      ctx.fillRect(0, S - 36, S, 36);
+      ctx.fillRect(0, S - 72, S, 72);
       ctx.fillStyle = '#fff';
-      ctx.font = 'bold 23px system-ui,sans-serif';
-      ctx.fillText(owner.name.slice(0, 12), 12, S - 9);
+      ctx.font = 'bold 42px system-ui,sans-serif';
+      ctx.fillText(owner.name.slice(0, 12), 24, S - 20);
     }
   });
 }
