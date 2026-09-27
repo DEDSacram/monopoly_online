@@ -3,10 +3,13 @@
 import {
   initBoard3D, renderBoard3D, animateSteps3D, animateFly3D,
   showDice3D, resetView3D, onTileClick3D, resize3D,
+  updateHUD3D, onHUDClick3D, openDialog3D, openDicePick3D,
+  setTargeting3D, isDialogOpen3D,
 } from './board3d.js';
 
 let G = null, gameId = null, playerId = null, ws = null;
 let boardReady = false;
+let flyTargeting = false;
 const $ = id => document.getElementById(id);
 const api = (m, u, b) => fetch(u, {method: m, headers: {"Content-Type": "application/json"}, body: b ? JSON.stringify(b) : undefined}).then(async r => {
   const j = await r.json().catch(() => ({}));
@@ -19,7 +22,10 @@ const N = 28; // board tiles
 function ensureBoard() {
   if (boardReady) return;
   initBoard3D($("board"));
+  onHUDClick3D(onHUD);
   onTileClick3D((idx, state) => {
+    // fly-targeting mode: clicking a glowing tile IS the destination picker
+    if (flyTargeting) { doFly(idx); return; }
     const t = state.board[idx];
     const owner = state.players.find(p => p.id === t.ownerId);
     $("hint").textContent = `#${idx} ${t.name} [side ${t.side}, ${t.type}]` +
@@ -27,8 +33,8 @@ function ensureBoard() {
       (t.rent != null ? ` · rent $${t.rent}` : "") +
       (t.level ? (t.level === 4 ? " · 🏨 HOTEL" : ` · houses Lv${t.level}`) : "") +
       (t.boost ? ` · 🏆x${t.boost}` : "") +
-      (owner ? ` · owned by ${owner.name}` : "");
-    $("flyDest").value = idx; // click sets the World Tour target
+      (owner ? ` · owned by ${owner.name}` : "") +
+      (t.index === 7 ? " · ✈️ no-fly zone" : "");
   });
   boardReady = true;
   resize3D();
@@ -59,41 +65,123 @@ $("btnJoin").onclick = async () => {
   } catch (e) { $("meInfo").textContent = e.message; }
 };
 $("btnStart").onclick = async () => { try { render((await api("POST", `/api/games/${gameId}/start`)).state); } catch (e) { $("hint").textContent = e.message; } };
-$("btnRoll").onclick = async () => {
+
+// ---- game actions (driven from the 3D HUD) ----
+async function doRoll() {
+  $("dice").classList.add("shake");
   try {
-    $("dice").classList.add("shake");
     const r = await api("POST", `/api/games/${gameId}/roll`, {playerId});
     $("dice").classList.remove("shake");
     animateMove(r);
   } catch (e) { $("dice").classList.remove("shake"); $("hint").textContent = e.message; }
-};
-$("btnCustom").onclick = async () => {
+}
+async function doFly(dest) {
+  flyTargeting = false;
+  setTargeting3D(false);
   try {
-    const r = await api("POST", `/api/games/${gameId}/custom-roll`, {playerId, d1: +$("cd1").value, d2: +$("cd2").value});
-    animateMove(r);
+    animateFly(await api("POST", `/api/games/${gameId}/fly`, {playerId, destination: dest}));
   } catch (e) { $("hint").textContent = e.message; }
-};
-$("btnReroll").onclick = async () => {
-  try { animateMove(await api("POST", `/api/games/${gameId}/reroll`, {playerId})); }
-  catch (e) { $("hint").textContent = e.message; }
-};
-$("btnBuy").onclick = async () => { try { render((await api("POST", `/api/games/${gameId}/buy`, {playerId})).state); } catch (e) { $("hint").textContent = e.message; } };
-$("btnEnd").onclick = async () => { try { render((await api("POST", `/api/games/${gameId}/end-turn`, {playerId})).state); } catch (e) { $("hint").textContent = e.message; } };
-$("btnJail").onclick = async () => {
-  try { render((await api("POST", `/api/games/${gameId}/pay-island`, {playerId})).state); }
-  catch { try { render((await api("POST", `/api/games/${gameId}/pay-jail`, {playerId})).state); } catch (e) { $("hint").textContent = e.message; } }
-};
-$("btnFly").onclick = async () => { try { animateFly(await api("POST", `/api/games/${gameId}/fly`, {playerId, destination: +$("flyDest").value})); } catch (e) { $("hint").textContent = e.message; } };
-$("btnBail").onclick = async () => {
+}
+function toggleFlyTargeting() {
+  const me = G.players.find(p => p.id === playerId);
+  if (!me || !me.tourPending) { $("hint").textContent = "no World Tour flight available"; return; }
+  flyTargeting = !flyTargeting;
+  setTargeting3D(flyTargeting);
+  $("hint").textContent = flyTargeting ? "✈️ click a glowing tile to fly there (Fly button cancels)" : "flight cancelled";
+  if (boardReady) updateHUD3D(hudDefs());
+}
+async function onHUD(id) {
   try {
     const me = G.players.find(p => p.id === playerId);
-    const mate = G.players.find(p => p.team === me.team && p.id !== playerId && !p.bankrupt);
-    if (!mate) throw new Error("no living partner");
-    render((await api("POST", `/api/games/${gameId}/bailout`, {playerId, to: mate.id, amount: +$("bailAmt").value})).state);
+    switch (id) {
+      case "roll": await doRoll(); break;
+      case "custom": {
+        const pick = await openDicePick3D();
+        if (pick) animateMove(await api("POST", `/api/games/${gameId}/custom-roll`, {playerId, d1: pick.d1, d2: pick.d2}));
+        break;
+      }
+      case "reroll":
+        animateMove(await api("POST", `/api/games/${gameId}/reroll`, {playerId}));
+        break;
+      case "buy": openBuyDialog3D(me.position); break;
+      case "upgrade":
+        render((await api("POST", `/api/games/${gameId}/upgrade`, {playerId, tile: me.position})).state);
+        break;
+      case "boost":
+        render((await api("POST", `/api/games/${gameId}/boost`, {playerId, tile: me.position})).state);
+        break;
+      case "fly": toggleFlyTargeting(); break;
+      case "island":
+        render((await api("POST", `/api/games/${gameId}/pay-island`, {playerId})).state);
+        break;
+      case "bail": bailoutDialog3D(); break;
+      case "end":
+        render((await api("POST", `/api/games/${gameId}/end-turn`, {playerId})).state);
+        break;
+      case "view": resetView3D(); break;
+      case "timer": timerDialog3D(); break;
+    }
+  } catch (e) { $("hint").textContent = e.message; }
+}
+
+// Contextual 3D HUD: only actions relevant right now.
+function hudDefs() {
+  const st = G;
+  if (!st || !boardReady) return [];
+  const me = st.players.find(p => p.id === playerId);
+  if (!me) return [{id: "view", label: "📷"}, {id: "timer", label: "⏱"}];
+  const d = [];
+  const myTurn = playerId && st.currentPlayerId === playerId && st.status === "playing";
+  if (myTurn) {
+    const cur = st.players[st.current];
+    if (!(cur && cur.hasRolled)) {
+      d.push({id: "roll", label: "🎲 Throw"});
+      d.push({id: "custom", label: `⚙️ ×${me.customDice}`, enabled: me.customDice > 0});
+      d.push({id: "reroll", label: `↻ ×${me.rerolls}`, enabled: me.rerolls > 0});
+    }
+    const t = st.board[me.position];
+    if (t.type === "property" && !t.ownerId) d.push({id: "buy", label: "Buy", sub: `$${t.price}`});
+    if (t.ownerId === playerId) {
+      if (t.level < 4) {
+        const cost = t.upgradeCost * (t.level + 1);
+        const r = me.laps < 1 ? "need 1 lap"
+          : (t.level + 1 === 4 && st.round < st.hotelUnlockRound) ? `hotel R${st.hotelUnlockRound}`
+          : (me.money < cost ? "no cash" : "");
+        d.push({id: "upgrade", label: `⬆ ${t.level + 1 === 4 ? "HOTEL" : "Lv" + (t.level + 1)}`, sub: r || `$${cost}`, enabled: !r});
+      }
+      if (t.boost < st.constants.maxBoost) {
+        const free = me.boostTokens > 0, c = st.constants.boostCost;
+        d.push({id: "boost", label: `🏆 ×${t.boost + 1}`, sub: free ? "token" : `$${c}`, enabled: free || me.money >= c});
+      }
+    }
+    if (me.tourPending) d.push({id: "fly", label: flyTargeting ? "✈️ Cancel" : "✈️ Fly"});
+    if (me.inJail) d.push({id: "island", label: "🏝️ Free", sub: `$${st.constants.islandFine}`, enabled: me.money >= st.constants.islandFine});
+    if (st.mode === "team") {
+      const mate = st.players.find(p => p.team === me.team && p.id !== playerId && !p.bankrupt);
+      if (mate) d.push({id: "bail", label: "💸 Bail", sub: mate.name.slice(0, 10)});
+    }
+    if (cur && cur.hasRolled) d.push({id: "end", label: "End ⏭"});
+  }
+  d.push({id: "timer", label: "⏱"});
+  d.push({id: "view", label: "📷"});
+  return d;
+}
+$("btnView").onclick = () => { if (boardReady) resetView3D(); };
+$("btnPanel").onclick = () => {
+  const side = $("side");
+  side.classList.toggle("hidden");
+  $("btnPanel").textContent = side.classList.contains("hidden") ? "▶ Show panel" : "◀ Hide panel";
+  if (boardReady) setTimeout(resize3D, 30);
+};
+$("btnFull").onclick = async () => {
+  try {
+    if (document.fullscreenElement) await document.exitFullscreen();
+    else await document.documentElement.requestFullscreen();
   } catch (e) { $("hint").textContent = e.message; }
 };
-$("btnTimer").onclick = async () => { try { render((await api("POST", `/api/games/${gameId}/timer`, {turnTimeout: +$("timerSet").value})).state); } catch (e) { $("hint").textContent = e.message; } };
-$("btnView").onclick = () => { if (boardReady) resetView3D(); };
+document.addEventListener("fullscreenchange", () => {
+  $("btnFull").textContent = document.fullscreenElement ? "⛶ Exit fullscreen" : "⛶ Fullscreen";
+});
 
 function connectWS() {
   if (ws) ws.close();
@@ -123,9 +211,131 @@ function describe(e) {
   }
 }
 
+// ---- 3D dialogs (all modal popups live in the scene) ----
+
+// Dice result dialog: shown right after the throw, token moves on Continue.
+async function diceDialog3D(res) {
+  const [d1, d2] = res.dice;
+  const tile = res.state.board[res.newPos];
+  await openDialog3D({
+    title: "🎲 You rolled",
+    big: `${DICE_FACES[d1]} ${DICE_FACES[d2]}`,
+    lines: [
+      `total ${d1 + d2}${d1 === d2 ? " · doubles!" : ""} → #${res.newPos} ${tile.name}`,
+      ...res.events.map(describe).slice(0, 4),
+    ],
+    options: [{id: "go", label: "▶ Move token"}],
+  });
+}
+
+const LEVEL_LABEL = ["Land only", "House Lv1", "Houses Lv2", "Houses Lv3", "🏨 HOTEL"];
+function levelPlan(t, level) {
+  let build = 0;
+  for (let l = 1; l <= level; l++) build += t.upgradeCost * l;
+  return {build, total: t.price + build};
+}
+
+// Buy dialog: single tap buys the city at the chosen level.
+async function openBuyDialog3D(tileIdx, err = "") {
+  while (true) {
+    const st = G;
+    const t = st.board[tileIdx];
+    if (!t || t.type !== "property" || t.ownerId) return;
+    const me = st.players.find(p => p.id === playerId);
+    if (!me || st.currentPlayerId !== playerId || st.status !== "playing") return;
+    const reason = lvl => {
+      if (lvl >= 1 && me.laps < 1) return "needs 1 lap";
+      if (lvl >= 4 && st.round < st.hotelUnlockRound) return `hotel at R${st.hotelUnlockRound}`;
+      if (me.money < levelPlan(t, lvl).total) return "can't afford";
+      return "";
+    };
+    const lines = [`price $${t.price} · rent $${t.rent} · you have $${me.money}`];
+    if (err) lines.push("! " + err);
+    const options = [0, 1, 2, 3, 4].map(lvl => {
+      const r = reason(lvl);
+      return {id: "lvl" + lvl, label: LEVEL_LABEL[lvl], sub: r || `$${levelPlan(t, lvl).total}`, disabled: !!r};
+    });
+    options.push({id: "skip", label: "Skip", accent: "#475569"});
+    const id = await openDialog3D({title: `🏙️ ${t.name}`, lines, options});
+    if (!id || id === "skip") return;
+    try {
+      render((await api("POST", `/api/games/${gameId}/buy-level`, {playerId, level: +id.slice(3)})).state);
+      return;
+    } catch (e) { err = e.message; }
+  }
+}
+
+// Lost Island dialog: pay the fee now or sit out the trap turns.
+async function islandDialog3D() {
+  const st = G;
+  const me = st.players.find(p => p.id === playerId);
+  if (!me || !me.inJail || st.currentPlayerId !== playerId || st.status !== "playing") return;
+  const fee = st.constants.islandFine;
+  const id = await openDialog3D({
+    title: "🏝️ Lost Island",
+    lines: [`trapped — doubles escape, or pay $${fee} (you have $${me.money})`],
+    options: [
+      {id: "pay", label: `Pay $${fee}`, sub: "walk free", disabled: me.money < fee},
+      {id: "stay", label: "Stay trapped", accent: "#475569"},
+    ],
+  });
+  if (id === "pay") {
+    try { render((await api("POST", `/api/games/${gameId}/pay-island`, {playerId})).state); }
+    catch (e) { $("hint").textContent = e.message; }
+  }
+}
+
+// Bailout dialog: fixed-amount options for the (single) living partner.
+async function bailoutDialog3D() {
+  const st = G;
+  const me = st.players.find(p => p.id === playerId);
+  const mate = me && st.players.find(p => p.team === me.team && p.id !== playerId && !p.bankrupt);
+  if (!mate) { $("hint").textContent = "no living partner"; return; }
+  const options = [50, 100, 250].map(a => ({
+    id: "a" + a, label: `$${a} → ${mate.name.slice(0, 12)}`,
+    sub: me.money - a < 0 ? "can't afford" : `leaves $${me.money - a}`, disabled: me.money - a < 0,
+  }));
+  options.push({id: "cancel", label: "Cancel", accent: "#475569"});
+  const id = await openDialog3D({title: "💸 Bail out partner", lines: [`you $${me.money} · ${mate.name} $${mate.money}`], options});
+  if (id && id !== "cancel") {
+    try { render((await api("POST", `/api/games/${gameId}/bailout`, {playerId, to: mate.id, amount: +id.slice(1)})).state); }
+    catch (e) { $("hint").textContent = e.message; }
+  }
+}
+
+// Timer dialog: fixed presets instead of a number input.
+async function timerDialog3D() {
+  const cur = G.turnTimeout;
+  const options = [0, 15, 30, 60].map(v => ({
+    id: "t" + v, label: v === 0 ? "Timer off" : `${v}s`, sub: v === cur ? "current" : "",
+  }));
+  options.push({id: "cancel", label: "Cancel", accent: "#475569"});
+  const id = await openDialog3D({title: "⏱ Turn timer", lines: ["auto-skips turns from round 3"], options});
+  if (id && id !== "cancel") {
+    try { render((await api("POST", `/api/games/${gameId}/timer`, {turnTimeout: +id.slice(1)})).state); }
+    catch (e) { $("hint").textContent = e.message; }
+  }
+}
+
+// Game-over dialog, once per finished game (winner or solo bankruptcy).
+let gameOverShown = null;
+async function maybeGameOverDialog3D(state) {
+  if (state.status !== "finished") return;
+  const key = `${state.id}|${state.winner || "none"}|${state.winReason}`;
+  if (gameOverShown === key) return;
+  gameOverShown = key;
+  const champ = state.players.find(p => p.id === state.winner) || {};
+  const reason = {resort_monopoly: "all 4 resorts", side_monopoly: "full board side", triple_monopoly: "triple monopoly", team_elimination: "rival team eliminated", bankruptcy: "last player standing"}[state.winReason] || state.winReason;
+  const head = state.winner
+    ? [`${champ.name || "?"} wins${state.mode === "team" && state.winningTeam != null ? ` · Team ${state.winningTeam + 1}` : ""}`, `by ${reason}`]
+    : ["💀 Bankrupt — no winner", "solo run over"];
+  await openDialog3D({title: "🏆 Game over", big: state.winner ? "🎉" : "💀", lines: head, options: [{id: "gg", label: "GG — close"}]});
+}
+
 async function animateMove(res) {
   const [d1, d2] = res.dice;
   $("dice").textContent = `${DICE_FACES[d1]} ${DICE_FACES[d2]} (${d1 + d2})`;
+  await diceDialog3D(res); // 3D result dialog first, move plays on Continue
   // 3D dice toss + token hop along the travelled path
   const seat = seatOf(res.state, playerId);
   let pos = res.oldPos;
@@ -135,6 +345,14 @@ async function animateMove(res) {
   await Promise.all([showDice3D(d1, d2), animateSteps3D(seat, path)]);
   $("hint").textContent = res.events.map(describe).join(" · ");
   render(res.state);
+  // landed on a buyable city -> offer buy-at-level dialog
+  const offer = res.events.find(e => e.type === "buy_offer");
+  if (offer && res.state.status === "playing" && res.state.currentPlayerId === playerId) {
+    const tile = res.state.board[offer.tile];
+    if (tile && !tile.ownerId) { openBuyDialog3D(offer.tile); return; }
+  }
+  // trapped on Lost Island -> pay-or-stay dialog
+  if (res.events.some(e => e.type === "goto_jail" || e.type === "jail_stay")) islandDialog3D();
 }
 
 async function animateFly(res) {
@@ -163,32 +381,23 @@ function render(state, fromWS = false) {
     `${p.bankrupt ? " 💀" : ""}${p.id === playerId ? " (you)" : ""}` +
     `<br>⚙️${p.customDice} ↻${p.rerolls} 🏆${p.boostTokens} · sets: ${p.completedGroups.join(",") || "-"}</div>`).join("");
   if (me) {
+    // read-only holdings: upgrades/boosts run from the 3D HUD while standing on the city
     const mine = state.board.filter(t => t.ownerId === playerId && t.type === "property");
-    $("myprops").innerHTML = mine.length ? "" : "<i>none yet — land on a city and press Buy (upgrades need 1 lap)</i>";
-    mine.forEach(t => {
-      const next = t.level + 1;
-      const lockedLap = me.laps < 1;
-      const lockedHotel = next === 4 && state.round < state.hotelUnlockRound;
-      const ub = document.createElement("button");
-      ub.textContent = `${t.name} Lv${t.level} → ${next === 4 ? "🏨 HOTEL" : "Lv" + next} ($${t.upgradeCost * next})${lockedLap ? " 🔒lap" : ""}${lockedHotel ? " 🔒R" + state.hotelUnlockRound : ""}`;
-      ub.disabled = t.level >= 4 || playerId !== state.currentPlayerId;
-      ub.onclick = async () => { try { render((await api("POST", `/api/games/${gameId}/upgrade`, {playerId, tile: t.index})).state); } catch (e) { $("hint").textContent = e.message; } };
-      const bb = document.createElement("button");
-      bb.textContent = `🏆 Boost ${t.name} (x${t.boost}→x${t.boost + 1}, ${me.boostTokens > 0 ? "free token" : "$" + state.constants.boostCost})`;
-      bb.disabled = t.boost >= state.constants.maxBoost || playerId !== state.currentPlayerId;
-      bb.onclick = async () => { try { render((await api("POST", `/api/games/${gameId}/boost`, {playerId, tile: t.index})).state); } catch (e) { $("hint").textContent = e.message; } };
-      $("myprops").appendChild(ub); $("myprops").appendChild(bb);
-    });
+    $("myprops").innerHTML = mine.length
+      ? mine.map(t => `<div>📍 #${t.index} ${t.name} — ` +
+          (t.level === 4 ? "🏨 HOTEL" : t.level ? `houses Lv${t.level}` : "land") +
+          (t.boost ? ` · 🏆×${t.boost}` : "") +
+          ` · rent $${t.rent}${me.position === t.index ? " · <b>you are here</b>" : ""}</div>`).join("")
+      : "<i>none yet — land on a city to buy (upgrades need 1 lap + standing on the city)</i>";
   }
   $("log").innerHTML = state.log.slice().reverse().map(l => `<div>${l}</div>`).join("");
-  const myTurn = playerId && state.currentPlayerId === playerId && state.status === "playing";
-  const cur = state.players[state.current];
-  $("btnRoll").disabled = !myTurn || (cur && cur.hasRolled);
-  $("btnCustom").disabled = !myTurn || (cur && cur.hasRolled) || (me && me.customDice <= 0);
-  $("btnReroll").disabled = !myTurn || (me && me.rerolls <= 0);
-  $("btnBuy").disabled = !myTurn;
-  $("btnEnd").disabled = !myTurn;
-  $("btnFly").disabled = !myTurn || !(me && me.tourPending);
+  // fly targeting only makes sense on your own armed turn
+  if (flyTargeting && !(me && me.tourPending && state.currentPlayerId === playerId && state.status === "playing")) {
+    flyTargeting = false;
+    setTargeting3D(false);
+  }
+  updateHUD3D(hudDefs());
+  maybeGameOverDialog3D(state);
 }
 
 setInterval(async () => {

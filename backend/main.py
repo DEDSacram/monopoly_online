@@ -38,6 +38,10 @@ class RollReq(BaseModel):
 class BuyReq(BaseModel):
     playerId: str
 
+class BuyLevelReq(BaseModel):
+    playerId: str
+    level: int
+
 class UpgradeReq(BaseModel):
     playerId: str
     tile: int
@@ -145,6 +149,18 @@ async def buy_prop(gid: str, req: BuyReq):
     g = _game(gid)
     try:
         res = mgr.buy(g, req.playerId)
+    except ValueError as e:
+        raise HTTPException(400, str(e))
+    res["state"] = g.to_dict()
+    await broadcast(gid)
+    return res
+
+@app.post("/api/games/{gid}/buy-level")
+async def buy_to_level(gid: str, req: BuyLevelReq):
+    """Buy the city you stand on, built straight to the chosen level."""
+    g = _game(gid)
+    try:
+        res = mgr.buy_to_level(g, req.playerId, req.level)
     except ValueError as e:
         raise HTTPException(400, str(e))
     res["state"] = g.to_dict()

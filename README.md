@@ -19,6 +19,8 @@ and animates tokens from the server's `{dice, oldPos, newPos, events}` response.
 - 28-tile board, $1500 start. Landing on an unowned city → option to buy.
 - Passing **Start** grants $200 salary **+ a lap**; laps unlock upgrades
   (houses Lv1–Lv3, 🏨 hotel Lv4 from round 4). Rent scales with level.
+- **Upgrades only where you stand** — houses, hotels and rent boosts can only
+  be built on the city your token is on (buy-at-level on purchase excepted).
 - Specials:
   - 🏝️ **Lost Island** — trapped 3 turns (doubles to escape) or pay $150;
     the ⛈️ Storm tile sends you there.
@@ -29,9 +31,24 @@ and animates tokens from the server's `{dice, oldPos, newPos, events}` response.
     (not Lost Island) on a later turn.
 - Instant wins: bankrupt everyone · all **4 resorts** · full **side** ·
   **3 color sets** (triple monopoly). Game ends immediately.
-- Modes: `ffa` or `team` (2v2: shared win, no rent on partner tiles, `/bailout`).
+- Modes: `ffa` (1–4, solo is a practice run — monopolies still win), or `team`
+  (2v2: shared win, no rent on partner tiles, `/bailout`).
 - Resources: 2× ⚙️ **custom dice** (targeted rolls) + 2× ↻ **re-rolls** per player.
 - Optional per-turn timer (`turnTimeout`, 0=off), active from round 3.
+
+## Frontend: fullscreen + everything in 3D
+- Full-viewport flex layout (board fills available space) + ⛶ Fullscreen toggle
+  + collapsible side panel for a near-fullscreen board.
+- No HTML controls in-game: a contextual **3D HUD bar** (camera-attached,
+  auto-fit to window width) shows only relevant actions — Throw / Custom (×left) /
+  Re-roll / Buy / Upgrade / Boost / Fly / Island / Bailout / End / Timer / View.
+- All dialogs are **3D panels in the scene** (orbit locks while open): 🎲 dice
+  result → ▶ move · 🏙️ buy-at-level (single tap, Lv0–4, lock reasons shown) ·
+  🏝️ island pay-or-stay · ⚙️ custom-dice stepper picker · 💸 bailout amounts ·
+  ⏱ timer presets · 🏆 game-over screen.
+- World Tour fly works by **clicking a glowing tile** (pulsing highlight,
+  Lost Island excluded); plain tile clicks inspect.
+- Rent / tax / chance / tokens need no extra dialog — itemized in the dice dialog.
 
 ## Run (docker)
 ```bash
@@ -48,9 +65,10 @@ docker compose up --build        # http://localhost:8000
 | POST | `/api/games/{id}/roll` `{playerId}` | random dice, server-side |
 | POST | `/api/games/{id}/custom-roll` `{playerId, d1, d2}` | targeted roll |
 | POST | `/api/games/{id}/reroll` `{playerId}` | undo + fresh roll |
-| POST | `/api/games/{id}/buy` `{playerId}` | buy landed city |
-| POST | `/api/games/{id}/upgrade` `{playerId, tile}` | needs 1 lap |
-| POST | `/api/games/{id}/boost` `{playerId, tile}` | rent inflation |
+| POST | `/api/games/{id}/buy` `{playerId}` | buy landed city (level 0) |
+| POST | `/api/games/{id}/buy-level` `{playerId, level}` | buy city built straight to Lv0–4 |
+| POST | `/api/games/{id}/upgrade` `{playerId, tile}` | needs 1 lap + standing on it |
+| POST | `/api/games/{id}/boost` `{playerId, tile}` | rent inflation, standing on it |
 | POST | `/api/games/{id}/fly` `{playerId, destination}` | World Tour |
 | POST | `/api/games/{id}/bailout` `{playerId, to, amount}` | team partner |
 | POST | `/api/games/{id}/end-turn` `{playerId}` | |

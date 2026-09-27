@@ -229,3 +229,96 @@ def test_reroll_void_after_buy():
         assert False, "re-roll must be void after buying"
     except ValueError:
         pass
+
+def test_buy_to_level_atomic():
+    m, g, ps = setup_game()
+    g.players[0].laps = 1
+    g.players[0].position = 3  # Portside $60, upgrade $50
+    before = g.players[0].money
+    r = m.buy_to_level(g, ps[0].id, 2)  # 60 + 50 + 100
+    assert r == {"tile": 3, "level": 2, "cost": 210}
+    assert g.players[0].money == before - 210
+    assert g.ownership[3] == ps[0].id and g.levels[3] == 2
+    assert g.upgrade_spent[3] == 150
+
+def test_buy_to_level_guards():
+    m, g, ps = setup_game()
+    g.players[0].position = 3
+    try:
+        m.buy_to_level(g, ps[0].id, 1)
+        assert False, "levels need a lap"
+    except ValueError as e:
+        assert "lap" in str(e)
+    g.players[0].laps = 1
+    try:
+        m.buy_to_level(g, ps[0].id, 4)
+        assert False, "hotel locked before round 4"
+    except ValueError as e:
+        assert "Hotel" in str(e)
+    g.round = 4
+    g.players[0].money = 100
+    try:
+        m.buy_to_level(g, ps[0].id, 2)
+        assert False, "must be atomic on insufficient funds"
+    except ValueError as e:
+        assert "need $" in str(e)
+    assert 3 not in g.ownership and g.players[0].money == 100
+
+def test_upgrade_requires_standing_on_city():
+    m, g, ps = setup_game()
+    g.players[0].laps = 1
+    g.players[0].position = 1; g.players[0].has_rolled = True
+    m.buy(g, ps[0].id)
+    g.players[0].position = 5  # walk away
+    try:
+        m.upgrade(g, ps[0].id, 1)
+        assert False, "must stand on the city to upgrade"
+    except ValueError as e:
+        assert "stand on" in str(e)
+    g.players[0].position = 1  # step back on it
+    assert m.upgrade(g, ps[0].id, 1)["level"] == 1
+
+def test_boost_requires_standing_on_city():
+    m, g, ps = setup_game()
+    g.players[0].position = 1; g.players[0].has_rolled = True
+    m.buy(g, ps[0].id)
+    g.players[0].boost_tokens = 1
+    g.players[0].position = 5  # walk away
+    try:
+        m.boost_rent(g, ps[0].id, 1)
+        assert False, "must stand on the city to boost"
+    except ValueError as e:
+        assert "stand on" in str(e)
+    g.players[0].position = 1
+    assert m.boost_rent(g, ps[0].id, 1)["boost"] == 1
+
+def setup_solo(timeout=0):
+    m = GameManager()
+    g = m.create(max_players=1, turn_timeout=timeout)
+    p = m.join(g, "Solo")
+    m.start(g)
+    return m, g, p
+
+def test_solo_start_roll_buy():
+    m, g, p = setup_solo()
+    assert g.status == "playing" and g.max_players == 1
+    r = m.roll(g, p.id, dice=[1, 2])  # -> tile 3 Portside
+    assert r["newPos"] == 3
+    m.buy(g, p.id)
+    assert g.ownership[3] == p.id
+    assert g.status == "playing"  # last-player rule must not end a solo run
+
+def test_solo_instant_win():
+    m, g, p = setup_solo()
+    for i in RESORT_TILES:
+        g.ownership[i] = p.id
+    assert g.check_monopoly_win(p.id)
+    assert g.status == "finished" and g.winner == p.id
+    assert g.win_reason == "resort_monopoly"
+
+def test_solo_bankruptcy_ends_winnerless():
+    m, g, p = setup_solo()
+    p.money = -1
+    m._bankrupt(g, p, [])
+    g.check_winner()
+    assert g.status == "finished" and g.winner is None

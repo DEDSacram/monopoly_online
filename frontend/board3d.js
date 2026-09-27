@@ -73,6 +73,14 @@ export function initBoard3D(container) {
   controls.maxDistance = 32;
   controls.maxPolarAngle = 1.35;
 
+  // camera-attached UI rig (HUD + dialogs stay readable while orbiting)
+  scene.add(camera);
+  uiRoot = new THREE.Group();
+  camera.add(uiRoot);
+  hudGroup = new THREE.Group();
+  dlgGroup = new THREE.Group();
+  uiRoot.add(hudGroup, dlgGroup);
+
   scene.add(new THREE.HemisphereLight(0xffffff, 0x334155, 0.95));
   const sun = new THREE.DirectionalLight(0xffffff, 1.6);
   sun.position.set(6, 14, 3);
@@ -170,6 +178,7 @@ export function initBoard3D(container) {
   let downXY = null;
   renderer.domElement.addEventListener('pointerdown', e => { downXY = [e.clientX, e.clientY]; });
   renderer.domElement.addEventListener('pointerup', e => {
+    if (routeUIClick(e)) return; // dialog / HUD buttons eat the click first
     if (!downXY || !tileClickCb || !lastState) return;
     const dx = e.clientX - downXY[0], dy = e.clientY - downXY[1];
     if (dx * dx + dy * dy > 36) return;
@@ -185,6 +194,7 @@ export function initBoard3D(container) {
 
   new ResizeObserver(() => resize3D()).observe(container);
   resize3D();
+  renderer.domElement.addEventListener('pointermove', routeUIHover);
 
   // gentle intro dolly into the Start-corner view
   const p0 = camera.position.clone(), p1 = CAM_POS.clone();
@@ -195,6 +205,14 @@ export function initBoard3D(container) {
 
   renderer.setAnimationLoop(() => {
     stepTweens();
+    if (targeting) { // pulse all flyable tiles
+      const k = 0.35 + 0.3 * Math.sin(performance.now() / 240);
+      tileMeshes.forEach((t, i) => {
+        if (i === ISLAND_TILE) return;
+        t.topMat.emissive.setHex(0x005577);
+        t.topMat.emissiveIntensity = k;
+      });
+    }
     controls.update();
     renderer.render(scene, camera);
   });
@@ -208,6 +226,7 @@ export function resize3D() {
   renderer.setSize(w, h);
   camera.aspect = w / h;
   camera.updateProjectionMatrix();
+  layoutHUD(); // re-fit HUD to the new aspect
 }
 
 export function resetView3D() {
@@ -514,4 +533,312 @@ export async function showDice3D(d1, d2) {
   await Promise.all(jobs);
   await wait(900);
   diceMeshes.forEach(m => { m.visible = false; });
+}
+
+// ================= in-3D UI: HUD action bar + modal dialogs =================
+// Everything is attached to the camera so it stays readable while orbiting.
+const ISLAND_TILE = 7;
+const UI_Z = -7;            // camera-space depth of all UI
+let uiRoot = null, hudGroup = null, dlgGroup = null;
+let hudBtns = [];           // {id, mesh, enabled}
+let dlgBtns = [];           // {id, mesh, enabled}
+let dlgResolve = null;
+let hudCb = null;
+let targeting = false;
+
+export function onHUDClick3D(cb) { hudCb = cb; }
+export function isDialogOpen3D() { return dlgResolve !== null; }
+export function setTargeting3D(on) {
+  targeting = on;
+  if (!ready) return;
+  if (on) setCursor3D(null);
+  else tileMeshes.forEach(t => { t.topMat.emissive.setHex(0x000000); t.topMat.emissiveIntensity = 1; });
+}
+
+function rectTex(w, h, draw) {
+  const c = document.createElement('canvas');
+  c.width = w; c.height = h;
+  draw(c.getContext('2d'), w, h);
+  const t = new THREE.CanvasTexture(c);
+  t.colorSpace = THREE.SRGBColorSpace;
+  t.anisotropy = 4;
+  return t;
+}
+
+function rr(ctx, x, y, w, h, r) {
+  ctx.beginPath();
+  ctx.moveTo(x + r, y);
+  ctx.arcTo(x + w, y, x + w, y + h, r);
+  ctx.arcTo(x + w, y + h, x, y + h, r);
+  ctx.arcTo(x, y + h, x, y, r);
+  ctx.arcTo(x, y, x + w, y, r);
+  ctx.closePath();
+}
+
+// A clickable 3D button, width fitted to its label. Returns {mesh, w, h}.
+function makeUIButton(label, sub, enabled, accent, h = 0.5) {
+  const fs = 46;
+  const meas = document.createElement('canvas').getContext('2d');
+  meas.font = `bold ${fs}px system-ui,sans-serif`;
+  const tw = meas.measureText(label.slice(0, 26)).width;
+  meas.font = '30px system-ui,sans-serif';
+  const sw = sub ? meas.measureText(sub.slice(0, 34)).width : 0;
+  const W = Math.ceil(Math.min(560, Math.max(tw, sw) + 96));
+  const H = sub ? 132 : 100;
+  const tex = rectTex(W, H, (ctx) => {
+    ctx.clearRect(0, 0, W, H);
+    rr(ctx, 3, 3, W - 6, H - 6, 22);
+    ctx.fillStyle = enabled ? (accent || '#22c55e') : '#334155';
+    ctx.fill();
+    ctx.fillStyle = enabled ? '#06240f' : '#94a3b8';
+    ctx.textAlign = 'center';
+    ctx.font = `bold ${fs}px system-ui,sans-serif`;
+    ctx.fillText(label.slice(0, 26), W / 2, sub ? 60 : 68);
+    if (sub) {
+      ctx.font = '30px system-ui,sans-serif';
+      ctx.fillStyle = enabled ? '#052e16' : '#64748b';
+      ctx.fillText(sub.slice(0, 34), W / 2, 104);
+    }
+  });
+  const w = h * (W / H);
+  const mesh = new THREE.Mesh(
+    new THREE.PlaneGeometry(w, h),
+    new THREE.MeshBasicMaterial({ map: tex, transparent: true, depthTest: false })
+  );
+  mesh.renderOrder = 1000;
+  mesh.userData.isUI = true;
+  return { mesh, w, h, tex };
+}
+
+function clearUIGroup(g) {
+  while (g.children.length) {
+    const m = g.children.pop();
+    // UI meshes own unique geometry/material/texture -> dispose all
+    if (m.geometry) m.geometry.dispose();
+    if (m.material) {
+      if (m.material.map) m.material.map.dispose();
+      m.material.dispose();
+    }
+  }
+}
+
+// HUD: single contextual action row at the bottom of the view.
+let lastHUDDefs = [];
+export function updateHUD3D(defs) {
+  if (!ready) return;
+  lastHUDDefs = defs;
+  clearUIGroup(hudGroup);
+  hudBtns = [];
+  for (const d of defs) {
+    const b = makeUIButton(d.label, d.sub || '', d.enabled !== false, d.accent, 0.46);
+    b.mesh.userData.hudId = d.id;
+    b.mesh.userData.enabled = d.enabled !== false;
+    hudGroup.add(b.mesh);
+    hudBtns.push({ id: d.id, mesh: b.mesh, enabled: b.mesh.userData.enabled, w: b.w, h: b.h });
+  }
+  layoutHUD();
+}
+
+function layoutHUD() {
+  if (!ready || !hudGroup || !hudBtns.length) return;
+  const gap = 0.12;
+  const total = hudBtns.reduce((s, b) => s + b.w, 0) + gap * (hudBtns.length - 1);
+  let x = -total / 2;
+  for (const b of hudBtns) {
+    b.mesh.position.set(x + b.w / 2, -2.62, UI_Z);
+    x += b.w + gap;
+  }
+  // shrink to fit narrow windows
+  const visW = 2 * Math.abs(UI_Z) * Math.tan(THREE.MathUtils.degToRad(camera.fov / 2)) * camera.aspect;
+  hudGroup.scale.setScalar(Math.min(1, (visW * 0.96) / total));
+}
+
+// Dialog engine: title + optional big text + body lines + option buttons.
+export function openDialog3D(spec) {
+  if (!ready) return Promise.resolve(null);
+  if (dlgResolve) { const r = dlgResolve; dlgResolve = null; try { r(null); } catch {} } // replace stale dialog
+  controls.enabled = false;
+  hudGroup.visible = false;
+  return new Promise(resolve => { dlgResolve = resolve; buildDialog(spec); });
+}
+
+function buildDialog(spec) {
+  clearUIGroup(dlgGroup);
+  dlgGroup.userData.step = null;
+  dlgBtns = [];
+  const lines = (spec.lines || []).slice(0, 7);
+  const titleH = 120, bigH = spec.big ? 200 : 0, lineH = 46;
+  const pad = 50;
+  const CH = Math.min(1024, titleH + bigH + lines.length * lineH + pad);
+  const tex = rectTex(1024, CH, (ctx, W, H) => {
+    ctx.fillStyle = 'rgba(30,41,59,0.97)';
+    rr(ctx, 4, 4, W - 8, H - 8, 36);
+    ctx.fill();
+    ctx.strokeStyle = '#fbbf24';
+    ctx.lineWidth = 6;
+    rr(ctx, 10, 10, W - 20, H - 20, 30);
+    ctx.stroke();
+    ctx.textAlign = 'center';
+    ctx.fillStyle = '#fff';
+    ctx.font = 'bold 68px system-ui,sans-serif';
+    ctx.fillText((spec.title || '').slice(0, 30), W / 2, 88);
+    let y = titleH;
+    if (spec.big) {
+      ctx.font = '150px system-ui,sans-serif';
+      ctx.fillText(spec.big.slice(0, 12), W / 2, y + 150);
+      y += bigH;
+    }
+    ctx.fillStyle = '#cbd5e1';
+    ctx.font = '36px system-ui,sans-serif';
+    for (const ln of lines) { y += lineH; ctx.fillText(String(ln).slice(0, 52), W / 2, y); }
+  });
+  const panelW = 5.6, panelH = panelW * (CH / 1024);
+  const panel = new THREE.Mesh(
+    new THREE.PlaneGeometry(panelW, panelH),
+    new THREE.MeshBasicMaterial({ map: tex, transparent: true, depthTest: false })
+  );
+  panel.renderOrder = 1000;
+  dlgGroup.add(panel);
+
+  const opts = spec.options || [];
+  const gap = 0.1;
+  const btnHs = opts.map(o => 0.55);
+  const btnsH = btnHs.reduce((s, h) => s + h + gap, 0);
+  const totalH = panelH + 0.25 + btnsH;
+  panel.position.set(0, totalH / 2 - panelH / 2 + 0.35, UI_Z);
+  let y = totalH / 2 - panelH - 0.25 + 0.35;
+  opts.forEach((o, k) => {
+    const b = makeUIButton(o.label, o.sub || o.reason || '', !o.disabled, o.accent, btnHs[k]);
+    b.mesh.position.set(0, y - btnHs[k] / 2, UI_Z);
+    y -= btnHs[k] + gap;
+    b.mesh.userData.dlgId = o.id;
+    b.mesh.userData.enabled = !o.disabled;
+    dlgGroup.add(b.mesh);
+    dlgBtns.push({ id: o.id, mesh: b.mesh, enabled: !o.disabled });
+  });
+  dlgGroup.position.set(0, 0, 0);
+}
+
+export function closeDialog3D(result) {
+  if (!ready) return;
+  const r = dlgResolve;
+  dlgResolve = null;
+  dlgBtns = [];
+  dlgGroup.userData.step = null;
+  clearUIGroup(dlgGroup);
+  hudGroup.visible = true;
+  controls.enabled = true;
+  if (r) { try { r(result ?? null); } catch {} }
+}
+
+// Custom-dice picker: steppers for d1/d2 + confirm. Resolves {d1,d2} | null.
+const PICK_FACES = ['', '⚀', '⚁', '⚂', '⚃', '⚄', '⚅'];
+export function openDicePick3D() {
+  if (!ready) return Promise.resolve(null);
+  if (dlgResolve) closeDialog3D(null);
+  controls.enabled = false;
+  hudGroup.visible = false;
+  let d1 = 3, d2 = 4;
+  return new Promise(resolve => {
+    dlgResolve = resolve;
+    // stepper layout: d1 pair left, d2 pair right, confirm/cancel below
+    const redraw = () => {
+      clearUIGroup(dlgGroup);
+      dlgBtns = [];
+      const tex = rectTex(1024, 420, (ctx, W, H) => {
+        ctx.fillStyle = 'rgba(30,41,59,0.97)';
+        rr(ctx, 4, 4, W - 8, H - 8, 36); ctx.fill();
+        ctx.strokeStyle = '#fbbf24'; ctx.lineWidth = 6;
+        rr(ctx, 10, 10, W - 20, H - 20, 30); ctx.stroke();
+        ctx.textAlign = 'center'; ctx.fillStyle = '#fff';
+        ctx.font = 'bold 68px system-ui,sans-serif';
+        ctx.fillText('⚙️ Custom die', W / 2, 88);
+        ctx.font = '150px system-ui,sans-serif';
+        ctx.fillText(`${PICK_FACES[d1]} ${PICK_FACES[d2]}`, W / 2, 260);
+        ctx.fillStyle = '#cbd5e1'; ctx.font = '36px system-ui,sans-serif';
+        ctx.fillText(`move exactly ${d1 + d2} tiles`, W / 2, 330);
+        ctx.fillText(`d1 = ${d1}      d2 = ${d2}`, W / 2, 380);
+      });
+      const panel = new THREE.Mesh(
+        new THREE.PlaneGeometry(5.6, 5.6 * (420 / 1024)),
+        new THREE.MeshBasicMaterial({ map: tex, transparent: true, depthTest: false })
+      );
+      panel.renderOrder = 1000;
+      dlgGroup.add(panel);
+      const opts = [
+        { id: 'd1-', label: 'd1 −' }, { id: 'd1+', label: 'd1 +' },
+        { id: 'd2-', label: 'd2 −' }, { id: 'd2+', label: 'd2 +' },
+        { id: 'ok', label: `▶ Roll ${d1 + d2}`, accent: '#22c55e' },
+        { id: 'cancel', label: 'Cancel', accent: '#475569' },
+      ];
+      // two columns for steppers, full-width confirm/cancel
+      const y0 = 0.4, rowH = 0.62;
+      const put = (o, x, y, wScale) => {
+        const b = makeUIButton(o.label, '', true, o.accent);
+        if (wScale && wScale !== 1) { b.mesh.scale.x = wScale; }
+        b.mesh.position.set(x, y, UI_Z);
+        b.mesh.userData.dlgId = o.id;
+        b.mesh.userData.enabled = true;
+        dlgGroup.add(b.mesh);
+        dlgBtns.push({ id: o.id, mesh: b.mesh, enabled: true });
+      };
+      panel.position.set(0, 1.55, UI_Z);
+      put(opts[0], -1.7, -0.75); put(opts[1], -0.1, -0.75);
+      put(opts[2], 1.7, -0.75); put(opts[3], 3.1 - 1.7 + 1.7, -0.75);
+      put(opts[4], 0, -1.47); put(opts[5], 0, -2.19);
+    };
+    const step = id => {
+      if (id === 'd1-') d1 = d1 > 1 ? d1 - 1 : 6;
+      else if (id === 'd1+') d1 = d1 < 6 ? d1 + 1 : 1;
+      else if (id === 'd2-') d2 = d2 > 1 ? d2 - 1 : 6;
+      else if (id === 'd2+') d2 = d2 < 6 ? d2 + 1 : 1;
+      else if (id === 'ok') { closeDialog3D({ d1, d2 }); return; }
+      else { closeDialog3D(null); return; }
+      redraw();
+    };
+    dlgGroup.userData.step = step;
+    redraw();
+  });
+}
+
+// ---- pointer routing: dialog buttons > HUD buttons > tiles ----
+function ptrNDC(e) {
+  const r = renderer.domElement.getBoundingClientRect();
+  return new THREE.Vector2(
+    ((e.clientX - r.left) / r.width) * 2 - 1,
+    -((e.clientY - r.top) / r.height) * 2 + 1
+  );
+}
+
+function routeUIClick(e) {
+  if (!ready) return false;
+  raycaster.setFromCamera(ptrNDC(e), camera);
+  if (dlgResolve) {
+    const hit = raycaster.intersectObjects(dlgBtns.map(b => b.mesh))[0];
+    if (hit && hit.object.userData.enabled) {
+      const id = hit.object.userData.dlgId;
+      if (dlgGroup.userData.step && id.startsWith('d')) { dlgGroup.userData.step(id); }
+      else { dlgGroup.userData.step = null; closeDialog3D(id); }
+    }
+    return true; // dialog eats all clicks
+  }
+  const hit = raycaster.intersectObjects(hudBtns.map(b => b.mesh))[0];
+  if (hit && hit.object.userData.enabled && hudCb) {
+    hudCb(hit.object.userData.hudId);
+    return true;
+  }
+  return false;
+}
+
+function routeUIHover(e) {
+  if (!ready) return;
+  raycaster.setFromCamera(ptrNDC(e), camera);
+  let list = dlgResolve ? dlgBtns : hudBtns;
+  const hit = raycaster.intersectObjects(list.map(b => b.mesh))[0];
+  renderer.domElement.style.cursor = hit && hit.object.userData.enabled ? 'pointer' : '';
+  const scaleAll = (arr, id) => arr.forEach(b => {
+    const on = hit && hit.object === b.mesh && b.enabled;
+    b.mesh.scale.setScalar(on ? 1.1 : 1);
+  });
+  scaleAll(dlgResolve ? dlgBtns : hudBtns);
 }

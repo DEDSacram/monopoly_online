@@ -377,9 +377,9 @@ class GameManager:
         if mode == "team":
             max_players = 4
         gid = uuid.uuid4().hex[:8]
-        g = Game(id=gid, max_players=min(4, max(2, max_players)),
+        g = Game(id=gid, max_players=min(4, max(1, max_players)),
                  turn_timeout=max(0, turn_timeout), mode=mode)
-        g.log_msg(f"Game {gid} created [{mode}]. Waiting for players (2-{g.max_players}).")
+        g.log_msg(f"Game {gid} created [{mode}]. Waiting for players (1-{g.max_players}).")
         self.games[gid] = g
         return g
 
@@ -415,8 +415,12 @@ class GameManager:
     def start(self, g: Game):
         if g.status != "waiting":
             raise ValueError("already started")
-        if len(g.players) < 2:
-            raise ValueError("need at least 2 players")
+        if len(g.players) < 1:
+            raise ValueError("need at least 1 player")
+        if g.mode == "team" and len(g.players) != 4:
+            raise ValueError("team mode needs exactly 4 players (2v2)")
+        if len(g.players) == 1:
+            g.log_msg("Solo practice run — monopolies still win instantly.")
         if g.mode == "team" and len(g.players) != 4:
             raise ValueError("team mode needs exactly 4 players (2v2)")
         g.status = "playing"
@@ -636,6 +640,46 @@ class GameManager:
         g.check_winner()
         return {"tile": idx}
 
+    def buy_to_level(self, g: Game, pid: str, level: int):
+        """Atomic buy + build straight to a level (powers the buy dialog)."""
+        g.check_timeout()
+        p = g.get_player(pid)
+        if not p or g.current_player().id != pid or g.status != "playing":
+            raise ValueError("not your turn")
+        if not 0 <= level <= 4:
+            raise ValueError("level must be 0-4")
+        idx = p.position
+        tile = BOARD[idx]
+        if tile["type"] != "property":
+            raise ValueError("nothing to buy here")
+        if idx in g.ownership:
+            raise ValueError("already owned")
+        if level >= 1 and p.laps < 1:
+            raise ValueError("complete a full lap (pass Start) to unlock upgrades")
+        if level >= 4 and g.round < HOTEL_UNLOCK_ROUND:
+            raise ValueError(f"Hotel (Lv4) unlocks at round {HOTEL_UNLOCK_ROUND} (now {g.round})")
+        build = sum(tile["upgrade_cost"] * l for l in range(1, level + 1))
+        total = tile["price"] + build
+        if p.money < total:
+            raise ValueError(f"need ${total} (have ${p.money})")
+        p.money -= total
+        g.ownership[idx] = pid
+        g.levels[idx] = level
+        if build:
+            g.upgrade_spent[idx] = build
+        g._snapshots.pop(pid, None)  # economy action voids re-roll
+        if level == 4:
+            g.log_msg(f"{p.name} buys {tile['name']} + HOTEL for ${total}.")
+        elif level > 0:
+            g.log_msg(f"{p.name} buys {tile['name']} + houses to Lv{level} for ${total}.")
+        else:
+            g.log_msg(f"{p.name} buys {tile['name']} for ${total}.")
+        if p.money < 0:
+            self._bankrupt(g, p, [])
+        g.check_monopoly_win(pid)
+        g.check_winner()
+        return {"tile": idx, "level": level, "cost": total}
+
     def upgrade(self, g: Game, pid: str, tile_idx: int):
         g.check_timeout()
         p = g.get_player(pid)
@@ -643,6 +687,8 @@ class GameManager:
             raise ValueError("not your turn")
         if g.ownership.get(tile_idx) != pid:
             raise ValueError("you don't own this property")
+        if p.position != tile_idx:
+            raise ValueError("must stand on the city to upgrade it")
         if p.laps < 1:
             raise ValueError("complete a full lap (pass Start) to unlock upgrades")
         lvl = g.levels.get(tile_idx, 0)
@@ -669,6 +715,8 @@ class GameManager:
             raise ValueError("not your turn")
         if g.ownership.get(tile_idx) != pid:
             raise ValueError("you don't own this property")
+        if p.position != tile_idx:
+            raise ValueError("must stand on the city to boost it")
         cur = g.boost.get(tile_idx, 0)
         if cur >= MAX_BOOST:
             raise ValueError("max boost reached")
