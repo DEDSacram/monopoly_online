@@ -10,6 +10,10 @@ and animates tokens from the server's `{dice, oldPos, newPos, events}` response.
   pawn tokens, house/hotel meshes, boost stars, owner flags, center logo slab.
 - Camera starts **at the Start corner** (behind tile #0) looking diagonally
   across the board; drag to orbit, scroll to zoom, 📷 button resets the view.
+- Every tile carries a **camera-facing name plate** (sprite): `#3 Portside`
+  plus price / rent + owner / level / boosts, bordered in the group color —
+  readable from the Start corner and every orbit angle. Flat tops show big
+  index / price / rent for at-a-glance reading when zoomed in.
 - Rolls play a 3D dice toss (correct pips face up) + token hop per tile;
   World Tour flights arc through the air. Clicking a tile inspects it and
   pre-fills the fly-target box. Three.js r160 is vendored under
@@ -37,8 +41,9 @@ and animates tokens from the server's `{dice, oldPos, newPos, events}` response.
 - Optional per-turn timer (`turnTimeout`, 0=off), active from round 3.
 
 ## Frontend: fullscreen + everything in 3D
-- Full-viewport flex layout (board fills available space) + ⛶ Fullscreen toggle
-  + collapsible side panel for a near-fullscreen board.
+- Full-viewport flex layout (board fills available space) + ⛶ button that puts
+  the **3D viewport itself** in fullscreen (page fallback) + collapsible side
+  panel for a near-fullscreen board.
 - No HTML controls in-game: a contextual **3D HUD bar** (camera-attached,
   auto-fit to window width) shows only relevant actions — Throw / Custom (×left) /
   Re-roll / Buy / Upgrade / Boost / Fly / Island / Bailout / End / Timer / View.

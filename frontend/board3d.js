@@ -271,58 +271,98 @@ function canvasTex(size, draw) {
 }
 
 function tileTexture(t, owner) {
-  const band = t.type === 'property'
+  const band = t.type === "property"
     ? '#' + GROUP_COLORS[t.group].toString(16).padStart(6, '0')
     : '#' + (SPECIAL_COLORS[t.type] ?? 0x64748b).toString(16).padStart(6, '0');
+  // flat top keeps only big at-a-glance facts; the name lives on the
+  // camera-facing sprite (always readable, incl. from the Start corner)
   return canvasTex(256, (ctx, S) => {
     ctx.fillStyle = '#f1f5f9';
     ctx.fillRect(0, 0, S, S);
     ctx.fillStyle = band;
-    ctx.fillRect(0, 0, S, 44);
+    ctx.fillRect(0, 0, S, 58);
     ctx.fillStyle = '#fff';
-    ctx.font = 'bold 24px system-ui,sans-serif';
-    ctx.fillText(`#${t.index}`, 10, 31);
+    ctx.font = 'bold 34px system-ui,sans-serif';
+    ctx.fillText(`#${t.index}`, 12, 41);
     ctx.textAlign = 'right';
-    ctx.fillText(`S${t.side}`, S - 10, 31);
+    ctx.fillText(`S${t.side}`, S - 12, 41);
     ctx.textAlign = 'left';
     ctx.fillStyle = '#0f172a';
-    ctx.font = 'bold 25px system-ui,sans-serif';
-    const words = t.name.split(' ');
-    const lines = [];
-    let cur = '';
-    for (const w of words) {
-      if ((cur + ' ' + w).trim().length > 12) { lines.push(cur.trim()); cur = w; }
-      else cur += ' ' + w;
-    }
-    lines.push(cur.trim());
-    lines.slice(0, 2).forEach((ln, k) => ctx.fillText(ln, 10, 76 + k * 29));
-    ctx.fillStyle = '#475569';
-    ctx.font = '21px system-ui,sans-serif';
-    let y = 140;
-    if (t.price) { ctx.fillText(`$${t.price}`, 10, y); y += 26; }
-    if (t.rent != null) { ctx.fillText(`rent $${t.rent}`, 10, y); y += 26; }
-    if (t.level === 4) {
+    ctx.font = 'bold 34px system-ui,sans-serif';
+    let y = 116;
+    if (t.price) { ctx.fillText(`$${t.price}`, 12, y); y += 44; }
+    if (t.rent != null) {
       ctx.fillStyle = '#b45309';
-      ctx.font = 'bold 24px system-ui,sans-serif';
-      ctx.fillText('HOTEL', 10, y); y += 26;
-    } else if (t.level > 0) {
-      ctx.fillStyle = '#15803d';
-      ctx.font = 'bold 24px system-ui,sans-serif';
-      ctx.fillText('H'.repeat(t.level) + ` Lv${t.level}`, 10, y); y += 26;
-    }
-    if (t.boost) {
-      ctx.fillStyle = '#b45309';
-      ctx.font = 'bold 24px system-ui,sans-serif';
-      ctx.fillText('★'.repeat(t.boost), 10, y);
+      ctx.fillText(`rent $${t.rent}`, 12, y);
     }
     if (owner) {
       ctx.fillStyle = owner.color;
-      ctx.fillRect(0, S - 34, S, 34);
+      ctx.fillRect(0, S - 36, S, 36);
       ctx.fillStyle = '#fff';
-      ctx.font = 'bold 21px system-ui,sans-serif';
-      ctx.fillText(owner.name.slice(0, 12), 10, S - 9);
+      ctx.font = 'bold 23px system-ui,sans-serif';
+      ctx.fillText(owner.name.slice(0, 12), 12, S - 9);
     }
   });
+}
+
+const TYPE_SHORT = {
+  go: 'START +$200', chance: 'CHANCE', tax_agency: 'TAX · 10% NET',
+  island: 'LOST ISLAND', tour: 'WORLD TOUR', championship: 'CHAMPIONSHIP',
+  sender: 'STORM → ISLAND',
+};
+
+function segmentsLine(ctx, segs, cx, y, font) {
+  ctx.font = font;
+  const widths = segs.map(s => ctx.measureText(s.text).width);
+  let x = cx - widths.reduce((a, b) => a + b, 0) / 2;
+  const prev = ctx.textAlign;
+  ctx.textAlign = 'left';
+  segs.forEach((s, k) => { ctx.fillStyle = s.color; ctx.fillText(s.text, x, y); x += widths[k]; });
+  ctx.textAlign = prev;
+}
+
+// Floating name plate: a sprite always faces the camera, so every city is
+// readable from the Start-corner view (and any orbit angle).
+function labelSprite(t, owner) {
+  const band = t.type === 'property'
+    ? '#' + GROUP_COLORS[t.group].toString(16).padStart(6, '0')
+    : '#' + (SPECIAL_COLORS[t.type] ?? 0x64748b).toString(16).padStart(6, '0');
+  const tex = rectTex(512, 224, (ctx, W, H) => {
+    ctx.clearRect(0, 0, W, H);
+    ctx.fillStyle = 'rgba(2,6,23,0.88)';
+    rr(ctx, 4, 4, W - 8, H - 8, 40);
+    ctx.fill();
+    ctx.strokeStyle = band;
+    ctx.lineWidth = 10;
+    rr(ctx, 10, 10, W - 20, H - 20, 32);
+    ctx.stroke();
+    ctx.textAlign = 'center';
+    ctx.fillStyle = '#fff';
+    ctx.font = 'bold 56px system-ui,sans-serif';
+    ctx.fillText(`#${t.index} ${t.name}`.slice(0, 20), W / 2, 86);
+    let segs;
+    if (t.type === 'property') {
+      segs = [];
+      if (t.level === 4) segs.push({text: 'HOTEL ', color: '#fbbf24'});
+      else if (t.level > 0) segs.push({text: `Lv${t.level} `, color: '#4ade80'});
+      if (owner) {
+        segs.push({text: `rent $${t.rent}`, color: '#fbbf24'});
+        segs.push({text: ' · ', color: '#64748b'});
+        segs.push({text: owner.name.slice(0, 10), color: owner.color});
+      } else {
+        segs.push({text: `$${t.price}`, color: '#4ade80'});
+      }
+      if (t.boost) segs.push({text: ` ★${t.boost}`, color: '#fbbf24'});
+    } else {
+      segs = [{text: TYPE_SHORT[t.type] || t.type, color: '#cbd5e1'}];
+    }
+    segmentsLine(ctx, segs, W / 2, 170, '46px system-ui,sans-serif');
+  });
+  const sp = new THREE.Sprite(new THREE.SpriteMaterial({map: tex, transparent: true}));
+  sp.scale.set(1.9, 1.9 * 224 / 512, 1);
+  const {x, z} = tileXZ(t.index);
+  sp.position.set(x, 1.28, z);
+  return sp;
 }
 
 function pipTexture(v) {
@@ -371,6 +411,14 @@ function clearGroup(g) {
   while (g.children.length) g.remove(g.children[0]);
 }
 
+// owner flag materials, cached per color (all marker materials are shared,
+// so marker rebuilds never leak)
+const flagMats = new Map();
+function flagMat(color) {
+  if (!flagMats.has(color)) flagMats.set(color, new THREE.MeshStandardMaterial({color, roughness: 0.4}));
+  return flagMats.get(color);
+}
+
 export function renderBoard3D(state) {
   if (!ready) return;
   lastState = state;
@@ -388,6 +436,9 @@ export function renderBoard3D(state) {
       tileMeshes[t.index].topMat.needsUpdate = true;
       if (old) old.dispose();
       const mg = markerGroups[t.index];
+      mg.children.forEach(m => { // sprites own unique textures: free them
+        if (m.isSprite) { if (m.material.map) m.material.map.dispose(); m.material.dispose(); }
+      });
       clearGroup(mg);
       const { x, z } = tileXZ(t.index);
       for (let h = 0; h < Math.min(t.level, 3); h++) {
@@ -412,10 +463,11 @@ export function renderBoard3D(state) {
       if (owner) {
         const pole = new THREE.Mesh(GEO.pole, MAT.pole);
         pole.position.set(x + 0.4, TILE_TOP + 0.27, z + 0.4);
-        const flag = new THREE.Mesh(GEO.flag, new THREE.MeshStandardMaterial({ color: owner.color, roughness: 0.4 }));
+        const flag = new THREE.Mesh(GEO.flag, flagMat(owner.color));
         flag.position.set(x + 0.4, TILE_TOP + 0.58, z + 0.4);
         mg.add(pole, flag);
       }
+      mg.add(labelSprite(t, owner)); // camera-facing name plate
     });
   }
   const csig = `${state.round}|${state.hotelUnlockRound}|${state.constants.resortTiles.join(',')}`;

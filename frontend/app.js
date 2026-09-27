@@ -176,7 +176,12 @@ $("btnPanel").onclick = () => {
 $("btnFull").onclick = async () => {
   try {
     if (document.fullscreenElement) await document.exitFullscreen();
-    else await document.documentElement.requestFullscreen();
+    else {
+      // fullscreen the 3D viewport itself (falls back to the whole page)
+      const wrap = $("boardWrap");
+      if (wrap && wrap.requestFullscreen) await wrap.requestFullscreen();
+      else await document.documentElement.requestFullscreen();
+    }
   } catch (e) { $("hint").textContent = e.message; }
 };
 document.addEventListener("fullscreenchange", () => {
