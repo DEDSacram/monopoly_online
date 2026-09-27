@@ -1,0 +1,77 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8"/>
+<meta name="viewport" content="width=device-width, initial-scale=1.0"/>
+<title>Monopoly Online</title>
+<link rel="stylesheet" href="/static/style.css"/>
+<script type="importmap">
+{"imports": {
+  "three": "/static/vendor/three.module.min.js",
+  "three/addons/": "/static/vendor/"
+}}
+</script>
+</head>
+<body>
+<div id="app">
+  <header><h1>🎲 Monopoly Online <span class="sub">cities · laps · instant wins · 2v2 · server-authoritative</span></h1></header>
+
+  <section id="lobby" class="card">
+    <h2>Lobby</h2>
+    <div class="row">
+      <button id="btnCreate">New game</button>
+      <label>Mode <select id="mode"><option value="ffa" selected>Free-for-all</option><option value="team">2v2 Teams</option></select></label>
+      <label>Max <select id="maxPlayers"><option>2</option><option>3</option><option selected>4</option></select></label>
+      <label>Turn timer (s, 0=off) <input id="timeout" type="number" value="30" min="0" max="120"/></label>
+    </div>
+    <div class="row">
+      <input id="gameId" placeholder="game id (to join)"/>
+      <input id="playerName" placeholder="your name" maxlength="16"/>
+      <label>Team <select id="team"><option value="">Auto</option><option value="0">Team 1</option><option value="1">Team 2</option></select></label>
+      <button id="btnJoin">Join</button>
+      <button id="btnStart">Start</button>
+    </div>
+    <div id="meInfo"></div>
+    <div class="rules">Pass <b>Start</b> (+$200) to earn a lap — laps unlock upgrades (houses Lv1–3, 🏨 hotel Lv4 from round 4).
+    Instant wins: all <b>4 resorts</b> · full <b>side</b> · <b>3 color sets</b>. Specials: Lost Island · Tax Agency (10%) · World Championship (rent boost) · World Tour (fly).</div>
+  </section>
+
+  <section id="game" class="hidden">
+    <div id="topbar">
+      <div id="status"></div>
+      <div id="timer"></div>
+      <div class="row">
+        <button id="btnRoll">🎲 Throw dice</button>
+        <label>⚙️ <input id="cd1" type="number" value="3" min="1" max="6" style="width:46px"/><input id="cd2" type="number" value="4" min="1" max="6" style="width:46px"/><button id="btnCustom" title="Targeted roll (uses resource)">Custom</button></label>
+        <button id="btnReroll">↻ Re-roll</button>
+        <button id="btnBuy">Buy city</button>
+        <button id="btnEnd">End turn</button>
+      </div>
+      <div class="row">
+        <button id="btnJail">🏝️ Pay island $150</button>
+        <label>✈️ Fly to <input id="flyDest" type="number" value="0" min="0" max="27" style="width:56px"/><button id="btnFly">Fly</button></label>
+        <label>💸 Bailout $<input id="bailAmt" type="number" value="100" min="1" style="width:70px"/><button id="btnBail">Send to partner</button></label>
+        <label>Timer <input id="timerSet" type="number" value="30" min="0" max="120" style="width:60px"/> <button id="btnTimer">Set</button></label>
+      </div>
+      <div id="dice">⚀ ⚀</div>
+      <div id="hint"></div>
+    </div>
+    <div id="layout">
+      <div id="boardWrap">
+        <div id="board"></div>
+        <div id="boardBar">
+          <button id="btnView">📷 Start-corner view</button>
+          <span class="dim">drag to orbit · scroll to zoom · click a tile to inspect / set fly target</span>
+        </div>
+      </div>
+      <aside id="side">
+        <h3>Players</h3><div id="players"></div>
+        <h3>My cities → upgrade / boost rent</h3><div id="myprops"></div>
+        <h3>Log</h3><div id="log"></div>
+      </aside>
+    </div>
+  </section>
+</div>
+<script type="module" src="/static/app.js"></script>
+</body>
+</html>
