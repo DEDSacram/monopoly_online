@@ -4,19 +4,19 @@ import {
   initBoard3D, renderBoard3D, animateSteps3D, animateFly3D,
   showDice3D, resetView3D, onTileClick3D, resize3D,
   updateHUD3D, onHUDClick3D, openDialog3D, openDicePick3D,
-  setTargeting3D, isDialogOpen3D, setPanelsVisible3D,
+  setTargeting3D, isDialogOpen3D, setPlatesVisible3D,
 } from './board3d.js';
 
 let G = null, gameId = null, playerId = null, ws = null;
 let boardReady = false;
 let flyTargeting = false;
-let panelsOn = true;
+let platesOn = true;
 
 function togglePanels() {
   if (!boardReady) return;
-  panelsOn = !panelsOn;
-  setPanelsVisible3D(panelsOn);
-  $("hint").textContent = panelsOn ? "floating panels on" : "floating panels off (clean board)";
+  platesOn = !platesOn;
+  setPlatesVisible3D(platesOn);
+  $("hint").textContent = platesOn ? "tile labels on" : "tile labels off (clean board)";
   updateHUD3D(hudDefs());
 }
 document.addEventListener("keydown", e => {
@@ -199,7 +199,7 @@ function hudDefs() {
     if (cur && cur.hasRolled) d.push({id: "end", label: "End ⏭"});
   }
   d.push({id: "timer", label: "⏱"});
-  d.push({id: "panels", label: "👁", sub: panelsOn ? "panels on" : "panels off"});
+  d.push({id: "panels", label: "👁", sub: platesOn ? "labels on" : "labels off"});
   d.push({id: "view", label: "📷"});
   return d;
 }

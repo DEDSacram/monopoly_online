@@ -10,8 +10,8 @@ and animates tokens from the server's `{dice, oldPos, newPos, events}` response.
   pawn tokens, house/hotel meshes, boost stars, owner flags, center logo slab.
 - Camera starts **at the Start corner** (behind tile #0) looking diagonally
   across the board; drag to orbit, scroll to zoom, 📷 button resets the view.
-- Every tile carries a **camera-facing name plate** (sprite): `#3 Portside`
-  plus price / rent + owner / level / boosts, bordered in the group color —
+- Every tile carries a **camera-facing name plate** (sprite): city name plus
+  price / rent + owner / level / boosts, bordered in the group color —
   readable from the Start corner and every orbit angle. Flat tops show big
   index / price / rent for at-a-glance reading when zoomed in. Clicking any
   tile tells you exactly what **you** would pay landing there (rent to whom,
@@ -21,6 +21,7 @@ and animates tokens from the server's `{dice, oldPos, newPos, events}` response.
 - Corner **roster overlay** in the scene (seats → TL/TR/BL/BR): name, cash,
   net worth, status icons, gold border on whose turn it is — every cash change
   pops the panel green/red with a rising `+$200` / `-$50` ticker.
+- 👁 HUD button or `H` key toggles the tile name plates (roster + tags stay on).
 - Rolls play a 3D dice toss (correct pips face up) + token hop per tile;
   World Tour flights arc through the air. Clicking a tile inspects it and
   pre-fills the fly-target box. Three.js r160 is vendored under

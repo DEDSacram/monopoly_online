@@ -22,8 +22,8 @@ const SEAT_OFF = [[-0.26, -0.26], [0.26, -0.26], [-0.26, 0.26], [0.26, 0.26]];
 let renderer, scene, camera, controls, raycaster;
 let tileMeshes = [];      // per-tile {mesh, topMat}
 let markerGroups = [];    // per-tile THREE.Group (houses/hotel/boost/flag/label)
-let plateSprites = [];    // per-tile label sprite (toggleable with panels)
-let panelsVisible = true; // floating panels (plates, roster, name tags) toggle
+let plateSprites = [];    // per-tile label sprite (toggleable)
+let platesVisible = true; // tile name plates toggle
 let tokenMeshes = [];     // per seat index
 let tokenTags = [];       // floating name sprites, one per seat
 let turnRing = null;      // pulsing marker under the current player's token
@@ -244,8 +244,8 @@ export function initBoard3D(container) {
     // name tags ride their tokens (even mid-hop); turn ring pulses under current
     for (let s = 0; s < tokenMeshes.length; s++) {
       const tk = tokenMeshes[s], tag = tokenTags[s];
-      tag.visible = tk.visible && panelsVisible;
-      if (tag.visible) tag.position.set(tk.position.x, tk.position.y + 1.0, tk.position.z);
+      tag.visible = tk.visible;
+      if (tk.visible) tag.position.set(tk.position.x, tk.position.y + 1.0, tk.position.z);
     }
     if (turnRing) {
       const tk = tokenMeshes[currentSeat];
@@ -540,7 +540,7 @@ export function renderBoard3D(state) {
         mg.add(pole, flag);
       }
       const plate = labelSprite(t, owner); // camera-facing name plate
-      plate.visible = panelsVisible;
+      plate.visible = platesVisible;
       mg.add(plate);
       plateSprites[t.index] = plate;
     });
@@ -943,10 +943,9 @@ function spawnMoneyFx(seat, delta) {
   moneyFx.push({seat, tint: gain ? 0x4ade80 : 0xf87171, start: performance.now()});
 }
 
-export function setPanelsVisible3D(v) {
-  panelsVisible = v;
+export function setPlatesVisible3D(v) {
+  platesVisible = v;
   if (!ready) return;
-  if (rosterGroup) rosterGroup.visible = v;
   for (const sp of plateSprites) if (sp) sp.visible = v;
 }
 
