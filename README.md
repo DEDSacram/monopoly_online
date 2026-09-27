@@ -13,7 +13,13 @@ and animates tokens from the server's `{dice, oldPos, newPos, events}` response.
 - Every tile carries a **camera-facing name plate** (sprite): `#3 Portside`
   plus price / rent + owner / level / boosts, bordered in the group color —
   readable from the Start corner and every orbit angle. Flat tops show big
-  index / price / rent for at-a-glance reading when zoomed in.
+  index / price / rent for at-a-glance reading when zoomed in. Clicking any
+  tile tells you exactly what **you** would pay landing there (rent to whom,
+  ~tax on your net worth, flight fee, trap warnings).
+- Chunky glowing pawns with floating **name tags**, tile plates pushed outward
+  so tokens stay visible, and a pulsing gold **ring under the current player**.
+- Corner **roster overlay** in the scene (seats → TL/TR/BL/BR): name, cash,
+  net worth, status icons, gold border on whose turn it is.
 - Rolls play a 3D dice toss (correct pips face up) + token hop per tile;
   World Tour flights arc through the air. Clicking a tile inspects it and
   pre-fills the fly-target box. Three.js r160 is vendored under

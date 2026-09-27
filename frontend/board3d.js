@@ -21,8 +21,12 @@ const SEAT_OFF = [[-0.26, -0.26], [0.26, -0.26], [-0.26, 0.26], [0.26, 0.26]];
 
 let renderer, scene, camera, controls, raycaster;
 let tileMeshes = [];      // per-tile {mesh, topMat}
-let markerGroups = [];    // per-tile THREE.Group (houses/hotel/boost/flag)
+let markerGroups = [];    // per-tile THREE.Group (houses/hotel/boost/flag/label)
 let tokenMeshes = [];     // per seat index
+let tokenTags = [];       // floating name sprites, one per seat
+let turnRing = null;      // pulsing marker under the current player's token
+let currentSeat = -1;
+let tagSig = '';
 let diceMeshes = [];
 let centerMesh = null, centerSig = '';
 let boardSig = '';
@@ -79,7 +83,8 @@ export function initBoard3D(container) {
   camera.add(uiRoot);
   hudGroup = new THREE.Group();
   dlgGroup = new THREE.Group();
-  uiRoot.add(hudGroup, dlgGroup);
+  rosterGroup = new THREE.Group();
+  uiRoot.add(hudGroup, dlgGroup, rosterGroup);
 
   scene.add(new THREE.HemisphereLight(0xffffff, 0x334155, 0.95));
   const sun = new THREE.DirectionalLight(0xffffff, 1.6);
@@ -98,8 +103,8 @@ export function initBoard3D(container) {
     boost: new THREE.OctahedronGeometry(0.1),
     pole: new THREE.CylinderGeometry(0.025, 0.025, 0.55, 8),
     flag: new THREE.SphereGeometry(0.09, 12, 10),
-    base: new THREE.CylinderGeometry(0.17, 0.2, 0.09, 16),
-    head: new THREE.SphereGeometry(0.155, 18, 14),
+    base: new THREE.CylinderGeometry(0.2, 0.23, 0.1, 16),
+    head: new THREE.SphereGeometry(0.19, 18, 14),
     die: new THREE.BoxGeometry(0.46, 0.46, 0.46),
   };
   Object.assign(MAT, {
@@ -144,21 +149,42 @@ export function initBoard3D(container) {
     markerGroups.push(mg);
   }
 
-  // tokens (4 seats max)
+  // tokens (4 seats max): chunky pawns with a white collar so they pop
+  // against tiles and labels
+  const collarMat = new THREE.MeshStandardMaterial({color: 0xffffff, roughness: 0.5});
   for (let s = 0; s < 4; s++) {
-    const mat = new THREE.MeshStandardMaterial({ color: 0xffffff, roughness: 0.35, emissive: 0x111111 });
+    const mat = new THREE.MeshStandardMaterial({color: 0xffffff, roughness: 0.35, emissive: 0x111111, emissiveIntensity: 0.4});
     const g = new THREE.Group();
     const base = new THREE.Mesh(GEO.base, mat);
-    base.position.y = 0.045;
+    base.position.y = 0.05;
+    const collar = new THREE.Mesh(new THREE.CylinderGeometry(0.21, 0.21, 0.05, 16), collarMat);
+    collar.position.y = 0.1;
     const head = new THREE.Mesh(GEO.head, mat);
-    head.position.y = 0.26;
+    head.position.y = 0.3;
     head.castShadow = true;
-    g.add(base, head);
+    g.add(base, collar, head);
     g.visible = false;
     g.userData.mat = mat;
     scene.add(g);
     tokenMeshes.push(g);
+    // floating name tag, glued to the token every frame (see animation loop)
+    const tag = new THREE.Sprite(new THREE.SpriteMaterial({transparent: true, depthTest: false}));
+    tag.scale.set(1.15, 1.15 * 80 / 256, 1);
+    tag.renderOrder = 998;
+    tag.visible = false;
+    scene.add(tag);
+    tokenTags.push(tag);
   }
+
+  // pulsing ring under the player whose turn it is
+  turnRing = new THREE.Mesh(
+    new THREE.RingGeometry(0.3, 0.4, 32),
+    new THREE.MeshBasicMaterial({color: 0xfbbf24, transparent: true, opacity: 0.8, side: THREE.DoubleSide, depthTest: false})
+  );
+  turnRing.rotation.x = -Math.PI / 2;
+  turnRing.renderOrder = 999;
+  turnRing.visible = false;
+  scene.add(turnRing);
 
   // dice (hidden until a roll); each die gets its own material set
   const pipTex = [];
@@ -213,6 +239,20 @@ export function initBoard3D(container) {
         t.topMat.emissiveIntensity = k;
       });
     }
+    // name tags ride their tokens (even mid-hop); turn ring pulses below #current
+    for (let s = 0; s < tokenMeshes.length; s++) {
+      const tk = tokenMeshes[s], tag = tokenTags[s];
+      tag.visible = tk.visible;
+      if (tk.visible) tag.position.set(tk.position.x, tk.position.y + 1.0, tk.position.z);
+    }
+    if (turnRing) {
+      const tk = tokenMeshes[currentSeat];
+      turnRing.visible = !!tk && tk.visible;
+      if (turnRing.visible) {
+        turnRing.position.set(tk.position.x, tk.position.y + 0.03, tk.position.z);
+        turnRing.material.opacity = 0.55 + 0.35 * Math.sin(performance.now() / 300);
+      }
+    }
     controls.update();
     renderer.render(scene, camera);
   });
@@ -227,6 +267,7 @@ export function resize3D() {
   camera.aspect = w / h;
   camera.updateProjectionMatrix();
   layoutHUD(); // re-fit HUD to the new aspect
+  layoutRoster(); // re-pin corner panels
 }
 
 export function resetView3D() {
@@ -283,7 +324,7 @@ function tileTexture(t, owner) {
     ctx.fillRect(0, 0, S, 58);
     ctx.fillStyle = '#fff';
     ctx.font = 'bold 34px system-ui,sans-serif';
-    ctx.fillText(`#${t.index}`, 12, 41);
+    ctx.fillText(`${t.index}`, 12, 41);
     ctx.textAlign = 'right';
     ctx.fillText(`S${t.side}`, S - 12, 41);
     ctx.textAlign = 'left';
@@ -339,7 +380,7 @@ function labelSprite(t, owner) {
     ctx.textAlign = 'center';
     ctx.fillStyle = '#fff';
     ctx.font = 'bold 56px system-ui,sans-serif';
-    ctx.fillText(`#${t.index} ${t.name}`.slice(0, 20), W / 2, 86);
+    ctx.fillText(t.name.slice(0, 20), W / 2, 86);
     let segs;
     if (t.type === 'property') {
       segs = [];
@@ -360,8 +401,10 @@ function labelSprite(t, owner) {
   });
   const sp = new THREE.Sprite(new THREE.SpriteMaterial({map: tex, transparent: true}));
   sp.scale.set(1.9, 1.9 * 224 / 512, 1);
+  // push the plate outward from board center so tile middles stay clear for tokens
   const {x, z} = tileXZ(t.index);
-  sp.position.set(x, 1.28, z);
+  const ol = Math.hypot(x, z) || 1;
+  sp.position.set(x + (x / ol) * 0.95, 1.28, z + (z / ol) * 0.95);
   return sp;
 }
 
@@ -488,6 +531,9 @@ export function renderBoard3D(state) {
     scene.add(centerMesh);
   }
   if (!tokenLock) {
+    currentSeat = state.currentPlayerId
+      ? Math.max(-1, state.players.findIndex(p => p.id === state.currentPlayerId))
+      : -1;
     state.players.forEach((p, s) => {
       const g = tokenMeshes[s];
       g.visible = true;
@@ -495,11 +541,35 @@ export function renderBoard3D(state) {
       g.position.copy(pos);
       const mat = g.userData.mat;
       mat.color.set(p.bankrupt ? 0x64748b : p.color);
+      mat.emissive.set(p.bankrupt ? 0x000000 : p.color);
+      mat.emissiveIntensity = p.bankrupt ? 0 : 0.45;
       mat.opacity = p.bankrupt ? 0.45 : 1;
       mat.transparent = p.bankrupt;
     });
     for (let s = state.players.length; s < 4; s++) tokenMeshes[s].visible = false;
   }
+  // name-tag textures only change with roster/color/bankruptcy, not movement
+  const tsig = JSON.stringify(state.players.map(p => [p.name, p.color, p.bankrupt]));
+  if (tsig !== tagSig) {
+    tagSig = tsig;
+    state.players.forEach((p, s) => {
+      const tag = tokenTags[s];
+      const old = tag.material.map;
+      tag.material.map = rectTex(256, 80, (ctx, W, H) => {
+        ctx.clearRect(0, 0, W, H);
+        ctx.fillStyle = p.bankrupt ? 'rgba(71,85,105,0.92)' : p.color;
+        rr(ctx, 2, 2, W - 4, H - 4, 26);
+        ctx.fill();
+        ctx.fillStyle = '#fff';
+        ctx.textAlign = 'center';
+        ctx.font = 'bold 44px system-ui,sans-serif';
+        ctx.fillText((p.bankrupt ? '💀 ' : '') + p.name.slice(0, 10), W / 2, 55);
+      });
+      tag.material.needsUpdate = true;
+      if (old) old.dispose();
+    });
+  }
+  updateRoster3D(state); // corner name+money panels
 }
 
 export function setCursor3D(i) {
@@ -592,6 +662,11 @@ export async function showDice3D(d1, d2) {
 const ISLAND_TILE = 7;
 const UI_Z = -7;            // camera-space depth of all UI
 let uiRoot = null, hudGroup = null, dlgGroup = null;
+let rosterGroup = null;       // corner money/name panels, one per player
+let rosterPanels = [];        // {mesh, seat}
+let rosterSig = '';
+let rosterCount = 0;
+let hudY = -2.62;
 let hudBtns = [];           // {id, mesh, enabled}
 let dlgBtns = [];           // {id, mesh, enabled}
 let dlgResolve = null;
@@ -697,12 +772,84 @@ function layoutHUD() {
   const total = hudBtns.reduce((s, b) => s + b.w, 0) + gap * (hudBtns.length - 1);
   let x = -total / 2;
   for (const b of hudBtns) {
-    b.mesh.position.set(x + b.w / 2, -2.62, UI_Z);
+    b.mesh.position.set(x + b.w / 2, hudY, UI_Z);
     x += b.w + gap;
   }
   // shrink to fit narrow windows
   const visW = 2 * Math.abs(UI_Z) * Math.tan(THREE.MathUtils.degToRad(camera.fov / 2)) * camera.aspect;
   hudGroup.scale.setScalar(Math.min(1, (visW * 0.96) / total));
+}
+
+// ---- corner roster: name + money per player (seats 0-3 -> corners) ----
+function rosterTexture(p, isCurrent, mode) {
+  return rectTex(512, 208, (ctx, W, H) => {
+    ctx.clearRect(0, 0, W, H);
+    ctx.fillStyle = 'rgba(2,6,23,0.88)';
+    rr(ctx, 4, 4, W - 8, H - 8, 34);
+    ctx.fill();
+    ctx.lineWidth = isCurrent ? 10 : 5;
+    ctx.strokeStyle = isCurrent ? '#fbbf24' : '#334155';
+    rr(ctx, 8, 8, W - 16, H - 16, 28);
+    ctx.stroke();
+    ctx.fillStyle = p.bankrupt ? '#475569' : p.color;
+    rr(ctx, 22, 22, 26, H - 44, 13);
+    ctx.fill();
+    ctx.textAlign = 'left';
+    ctx.fillStyle = p.bankrupt ? '#94a3b8' : '#fff';
+    ctx.font = 'bold 50px system-ui,sans-serif';
+    const status = `${isCurrent ? '👉' : ''}${p.inJail ? '🏝️' : ''}${p.tourPending ? '✈️' : ''}${p.bankrupt ? '💀' : ''}`;
+    ctx.fillText(`${status}${p.name.slice(0, 10)}`, 64, 84);
+    ctx.fillStyle = '#4ade80';
+    ctx.font = 'bold 56px system-ui,sans-serif';
+    ctx.fillText(`$${p.money}`, 64, 158);
+    ctx.fillStyle = '#94a3b8';
+    ctx.font = '32px system-ui,sans-serif';
+    ctx.fillText(`net $${p.netWorth}${mode === 'team' ? ` · T${p.team + 1}` : ''}`, 64, 192);
+  });
+}
+
+function updateRoster3D(state) {
+  const sig = JSON.stringify(state.players.map(p =>
+    [p.name, p.color, p.money, p.netWorth, p.bankrupt, p.inJail, p.tourPending, p.team,
+     state.currentPlayerId === p.id, state.mode]));
+  if (sig !== rosterSig) {
+    rosterSig = sig;
+    while (rosterGroup.children.length) {
+      const m = rosterGroup.children.pop();
+      if (m.geometry) m.geometry.dispose();
+      if (m.material) { if (m.material.map) m.material.map.dispose(); m.material.dispose(); }
+    }
+    rosterPanels = [];
+    state.players.forEach((p, s) => {
+      const mesh = new THREE.Mesh(
+        new THREE.PlaneGeometry(2.3, 2.3 * 208 / 512),
+        new THREE.MeshBasicMaterial({
+          map: rosterTexture(p, state.currentPlayerId === p.id, state.mode),
+          transparent: true, depthTest: false,
+        })
+      );
+      mesh.renderOrder = 1000;
+      mesh.userData.isUI = true;
+      rosterGroup.add(mesh);
+      rosterPanels.push({mesh, seat: s});
+    });
+  }
+  rosterCount = state.players.length;
+  hudY = rosterCount > 2 ? -1.85 : -2.62; // lift HUD when bottom corners are taken
+  layoutRoster();
+  layoutHUD();
+}
+
+function layoutRoster() {
+  if (!ready || !rosterGroup) return;
+  const hh = Math.abs(UI_Z) * Math.tan(THREE.MathUtils.degToRad(camera.fov / 2));
+  const hw = hh * camera.aspect;
+  // seats 0..3 -> TL, TR, BL, BR
+  const spots = [[-1, 1], [1, 1], [-1, -1], [1, -1]];
+  for (const {mesh, seat} of rosterPanels) {
+    const [sx, sy] = spots[seat % 4];
+    mesh.position.set(sx * (hw - 1.15 - 0.22), sy * (hh - 0.47 - 0.22), UI_Z);
+  }
 }
 
 // Dialog engine: title + optional big text + body lines + option buttons.

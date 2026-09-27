@@ -27,14 +27,16 @@ function ensureBoard() {
     // fly-targeting mode: clicking a glowing tile IS the destination picker
     if (flyTargeting) { doFly(idx); return; }
     const t = state.board[idx];
+    const me = state.players.find(p => p.id === playerId);
     const owner = state.players.find(p => p.id === t.ownerId);
-    $("hint").textContent = `#${idx} ${t.name} [side ${t.side}, ${t.type}]` +
+    $("hint").textContent = `${t.name} (tile ${idx}, side ${t.side}, ${t.type})` +
       (t.price ? ` · buy $${t.price}` : "") +
       (t.rent != null ? ` · rent $${t.rent}` : "") +
       (t.level ? (t.level === 4 ? " · 🏨 HOTEL" : ` · houses Lv${t.level}`) : "") +
       (t.boost ? ` · 🏆x${t.boost}` : "") +
       (owner ? ` · owned by ${owner.name}` : "") +
-      (t.index === 7 ? " · ✈️ no-fly zone" : "");
+      (t.index === 7 ? " · ✈️ no-fly zone" : "") +
+      (me ? ` · 💸 YOU: ${landingCost(state, me, t)}` : "");
   });
   boardReady = true;
   resize3D();
@@ -42,6 +44,25 @@ function ensureBoard() {
 
 function seatOf(state, pid) {
   return Math.max(0, state.players.findIndex(p => p.id === pid));
+}
+
+// What would *you* pay if you stepped on this tile right now?
+function landingCost(state, me, t) {
+  if (t.type === "property") {
+    const owner = state.players.find(p => p.id === t.ownerId);
+    if (!owner) return `for sale $${t.price}`;
+    if (owner.id === me.id) return "yours — free";
+    if (state.mode === "team" && owner.team === me.team) return `teammate ${owner.name} — free`;
+    return `you'd pay $${t.rent} to ${owner.name}`;
+  }
+  if (t.type === "tax_agency") return `you'd pay ~$${Math.max(1, Math.floor(me.netWorth * 0.10))} (10% of your net)`;
+  if (t.type === "tour") return me.tourPending ? "already armed — fly from here" : `you'd pay $${state.constants.flightFee} and arm a flight`;
+  if (t.type === "sender") return "⚠️ Storm → trapped on Lost Island";
+  if (t.type === "island") return me.inJail ? "you are trapped here" : "just visiting — safe";
+  if (t.type === "championship") return "+1 rent-boost token";
+  if (t.type === "chance") return "luck of the draw";
+  if (t.type === "go") return `+$${state.constants.startSalary} + lap when passed`;
+  return "safe";
 }
 
 $("btnCreate").onclick = async () => {
@@ -226,7 +247,7 @@ async function diceDialog3D(res) {
     title: "🎲 You rolled",
     big: `${DICE_FACES[d1]} ${DICE_FACES[d2]}`,
     lines: [
-      `total ${d1 + d2}${d1 === d2 ? " · doubles!" : ""} → #${res.newPos} ${tile.name}`,
+      `total ${d1 + d2}${d1 === d2 ? " · doubles!" : ""} → ${tile.name} (tile ${res.newPos})`,
       ...res.events.map(describe).slice(0, 4),
     ],
     options: [{id: "go", label: "▶ Move token"}],
@@ -389,7 +410,7 @@ function render(state, fromWS = false) {
     // read-only holdings: upgrades/boosts run from the 3D HUD while standing on the city
     const mine = state.board.filter(t => t.ownerId === playerId && t.type === "property");
     $("myprops").innerHTML = mine.length
-      ? mine.map(t => `<div>📍 #${t.index} ${t.name} — ` +
+      ? mine.map(t => `<div>📍 ${t.name} (tile ${t.index}) — ` +
           (t.level === 4 ? "🏨 HOTEL" : t.level ? `houses Lv${t.level}` : "land") +
           (t.boost ? ` · 🏆×${t.boost}` : "") +
           ` · rent $${t.rent}${me.position === t.index ? " · <b>you are here</b>" : ""}</div>`).join("")
