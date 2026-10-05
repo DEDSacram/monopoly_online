@@ -4,3 +4,13 @@ services:
     ports:
       - "8000:8000"
     restart: unless-stopped
+  cloudflared:
+    image: cloudflare/cloudflared:latest
+    command: tunnel --config /etc/cloudflared/config.yml run
+    user: "1000:1000"
+    volumes:
+      - /home/sacram/.cloudflared/9dc4a5f4-c467-4e96-943e-9605ae60f4b0.json:/etc/cloudflared/9dc4a5f4-c467-4e96-943e-9605ae60f4b0.json:ro
+      - ./cloudflared.yml:/etc/cloudflared/config.yml:ro
+    restart: unless-stopped
+    depends_on:
+      - monopoly

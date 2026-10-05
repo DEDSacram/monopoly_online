@@ -1,8 +1,17 @@
-// 3D Monopoly board (Three.js). Camera lives at the Start corner,
-// looking diagonally across the board. All game rules stay server-side;
-// this module only renders state + plays movement animations.
+// 3D Monopoly board (Three.js). The whole site is a single WebGL canvas:
+// tavern room, board, pawns, four seated characters and a seat / freecam rig.
+// All game rules stay server-side; this module only renders state + animates.
 import * as THREE from 'three';
 import { OrbitControls } from './vendor/OrbitControls.js';
+import { buildRoom, buildTable, barrel, mug, shelf, chalkboard, cards, dust, tex2d, roundRect, setAnisotropy } from './env3d.js';
+import {
+  buildCharacters, updateCharTag, setCharActive, stepCharacters,
+  SEAT_SPOTS, CHAR_SCALE, FLOOR_Y,
+} from './chars3d.js';
+
+// seated eye height in world units (the model's eye landmark, floor-relative)
+const SEAT_EYE = FLOOR_Y + 1.45 * CHAR_SCALE;
+const TABLE_TOP = -0.3;    // top surface of the tavern table
 
 const PITCH = 1.16;          // world spacing between tile centers
 const TILE = 1.06;           // tile footprint
@@ -15,47 +24,203 @@ const GROUP_COLORS = {
 };
 const SPECIAL_COLORS = {
   go: 0x16a34a, chance: 0x7c3aed, tax_agency: 0xb45309, island: 0x0ea5e9,
-  tour: 0x0284c7, championship: 0xeab308, sender: 0x475569,
+  tour: 0x0284c7, championship: 0xeab308, sender: 0x334155,
 };
 const SEAT_OFF = [[-0.26, -0.26], [0.26, -0.26], [-0.26, 0.26], [0.26, 0.26]];
+
+const GROUP_NAMES = {
+  brown: 'OLD TOWN', cyan: 'NEON', pink: 'SAKURA', orange: 'EMBER',
+  red: 'RUBY', green: 'PINE', blue: 'AZURE', resort: 'RESORTS',
+};
+const TYPE_INFO = {
+  go: ['▶', 'START', '+$200 & A LAP'],
+  chance: ['?', 'CHANCE', 'LUCK OF THE DRAW'],
+  tax_agency: ['%', 'TAX', '10% OF NET WORTH'],
+  island: ['▲', 'LOST ISLAND', 'DOUBLES OR $150'],
+  tour: ['✈', 'WORLD TOUR', '$100 · THEN FLY'],
+  championship: ['★', 'CHAMPIONSHIP', '+1 RENT BOOST'],
+  sender: ['☁', 'STORM', 'SENT TO ISLAND'],
+};
 
 let renderer, scene, camera, controls, raycaster;
 let tileMeshes = [];      // per-tile {mesh, topMat}
 let markerGroups = [];    // per-tile THREE.Group (houses/hotel/boost/flag/label)
 let plateSprites = [];    // per-tile label sprite (toggleable)
-let platesVisible = true; // tile name plates toggle
-let tokenMeshes = [];     // per seat index
-let tokenTags = [];       // floating name sprites, one per seat
-let turnRing = null;      // pulsing marker under the current player's token
+let platesVisible = true;
+let tokenMeshes = [];
+let turnRing = null;
 let currentSeat = -1;
-let tagSig = '';
+let mySeat = -1;
 let diceMeshes = [];
 let centerMesh = null, centerSig = '';
 let boardSig = '';
 let cursor = null;
 let tokenLock = false;
 let tileClickCb = null;
+let seatClickCb = null;
 let lastState = null;
 let ready = false;
+let chars = [];
+let stepDust = null;
 
-// shared geometry / materials
+// ui bridge (set by attachUI): keeps dialogs able to freeze the camera
+let UI = null;
+
 let GEO = {};
 const MAT = {};
 
+function tileColRow(i) {
+  if (i <= 7) return { col: i, row: 0 };
+  if (i <= 13) return { col: 7, row: i - 7 };
+  if (i <= 21) return { col: 7 - (i - 14), row: 7 };
+  return { col: 0, row: 6 - (i - 22) };
+}
+
 function tileXZ(i) {
-  let col, row;
-  if (i <= 7) { col = i; row = 0; }
-  else if (i <= 13) { col = 7; row = i - 7; }
-  else if (i <= 21) { col = 7 - (i - 14); row = 7; }
-  else { col = 0; row = 6 - (i - 22); }
+  const { col, row } = tileColRow(i);
   return { x: (col - 3.5) * PITCH, z: (row - 3.5) * PITCH };
 }
 
 // Start tile (index 0) sits at the min-x/min-z corner.
 const START_XZ = tileXZ(0);
-const CAM_POS = new THREE.Vector3(START_XZ.x - 4.6, 8.4, START_XZ.z - 4.6);
-const CAM_TGT = new THREE.Vector3(0.4, 0, 0.4);
+// freecam home: high over the Start corner, whole table + characters in frame
+const CAM_POS = new THREE.Vector3(START_XZ.x - 6, 15, START_XZ.z - 6);
+const CAM_TGT = new THREE.Vector3(0, -1.6, 0);
 
+// ---------------- camera rig: freecam (orbit) + on-model (first person) -----
+const CAM = {
+  mode: 'free',          // 'free' | 'seat'
+  seat: 0,               // which character's head the camera rides
+  yaw: 0, pitch: -0.22,  // look angles while seated
+  zoom: 0.55,            // 0..1 seated eye height blend
+  blend: 0,              // 0 = freecam pose, 1 = seated pose
+  freePos: new THREE.Vector3(),
+  freeTgt: new THREE.Vector3(),
+  freeQuat: new THREE.Quaternion(),
+  keys: {},
+  looking: false, lastX: 0, lastY: 0,
+  focus: null,           // {tile, start} camera move toward a tile
+};
+const TMP_V = new THREE.Vector3();
+const TMP_V2 = new THREE.Vector3();
+const TMP_Q = new THREE.Quaternion();
+const TMP_M = new THREE.Matrix4();
+
+// eye position of a seated character (rises with the in-chair bounce)
+function seatEye(seat, out = new THREE.Vector3()) {
+  const spot = SEAT_SPOTS[seat];
+  out.set(spot.x, SEAT_EYE + 1.4 + CAM.zoom * 2.2, spot.z);
+  const c = chars[seat];
+  if (c) out.y += (c.outer.position.y - FLOOR_Y); // ride the idle bob
+  return out;
+}
+function seatDir(out = new THREE.Vector3()) {
+  const cp = Math.cos(CAM.pitch);
+  return out.set(Math.sin(CAM.yaw) * cp, Math.sin(CAM.pitch), Math.cos(CAM.yaw) * cp);
+}
+
+export function getCameraMode3D() { return CAM.mode; }
+export function getViewSeat3D() { return CAM.seat; }
+
+export function setViewSeat3D(seat, jump = false) {
+  if (seat < 0 || seat > 3) return;
+  CAM.seat = seat;
+  const base = SEAT_SPOTS[seat].yaw;
+  CAM.yaw = base; CAM.pitch = -0.22;
+  chars.forEach((c, s) => { c.highlight = s === seat ? 1 : 0; });
+  if (CAM.mode !== 'seat') {
+    // freecam: orbit the new character's shoulder instead of jumping
+    orbitAroundSeat(seat, jump);
+    return;
+  }
+  if (jump) CAM.blend = 1;
+}
+
+// Freecam parks over the selected character's shoulder, table in frame.
+function orbitAroundSeat(seat, jump) {
+  const spot = SEAT_SPOTS[seat];
+  const back = new THREE.Vector3(Math.sin(spot.yaw), 0, Math.cos(spot.yaw));
+  const p = new THREE.Vector3(
+    spot.x + back.x * 3.6,
+    SEAT_EYE + 3.4,
+    spot.z + back.z * 3.6
+  );
+  const from = { p: camera.position.clone(), t: controls.target.clone() };
+  if (jump) {
+    camera.position.copy(p);
+    controls.target.set(0, 0.2, 0);
+    controls.update();
+    return;
+  }
+  tween(0.7, k => {
+    const e = 1 - Math.pow(1 - k, 3);
+    camera.position.lerpVectors(from.p, p, e);
+    controls.target.lerpVectors(from.t, CAM_TGT, e);
+  });
+}
+
+export function cycleViewSeat3D() {
+  setViewSeat3D((CAM.seat + 1) % 4);
+  return CAM.seat;
+}
+
+export function setCameraMode3D(mode) {
+  if (mode === CAM.mode) return;
+  if (mode === 'seat') {
+    // remember where freecam was so switching back is lossless
+    CAM.freePos.copy(camera.position);
+    CAM.freeTgt.copy(controls.target);
+    CAM.freeQuat.copy(camera.quaternion);
+    controls.enabled = false;
+    CAM.yaw = SEAT_SPOTS[CAM.seat].yaw;
+    CAM.pitch = -0.22;
+    tween(0.75, k => { CAM.blend = k; });
+    CAM.mode = 'seat';
+  } else {
+    CAM.mode = 'free';
+    tween(0.75, k => { CAM.blend = 1 - k; }).then(() => {
+      if (CAM.mode !== 'free') return;
+      camera.position.copy(CAM.freePos);
+      controls.target.copy(CAM.freeTgt);
+      camera.lookAt(CAM.freeTgt);
+      controls.enabled = true;
+      controls.update();
+    });
+  }
+  syncCharNeck();
+}
+
+function syncCharNeck() {
+  // riding a character: hide its head (you are the head), show it otherwise
+  chars.forEach((c, s) => {
+    c.neck.visible = !(CAM.mode === 'seat' && s === CAM.seat);
+    c.ride = CAM.mode === 'seat' && s === CAM.seat;
+  });
+}
+
+// Point the seated view (or the orbit pivot) at a specific tile.
+export function focusTile3D(idx, jump = false) {
+  const { x, z } = tileXZ(idx);
+  if (CAM.mode === 'seat') {
+    CAM.yaw = Math.atan2(x - CAM_TGT.x, z - CAM_TGT.z);
+    CAM.pitch = -0.1;
+    return;
+  }
+  const t = new THREE.Vector3(x, 0.4, z);
+  const from = { p: camera.position.clone(), t: controls.target.clone() };
+  const dir = TMP_V.copy(camera.position).sub(controls.target).normalize();
+  const dist = Math.max(4.5, Math.min(9, camera.position.distanceTo(controls.target)));
+  const to = t.clone().add(dir.multiplyScalar(dist));
+  if (jump) {
+    camera.position.copy(to); controls.target.copy(t); controls.update();
+  } else tween(0.7, k => {
+    const e = 1 - Math.pow(1 - k, 3);
+    camera.position.lerpVectors(from.p, to, e);
+    controls.target.lerpVectors(from.t, t, e);
+  });
+}
+
+// ---------------- scene ----------------
 export function initBoard3D(container) {
   if (ready) return;
   renderer = new THREE.WebGLRenderer({ antialias: true });
@@ -63,40 +228,49 @@ export function initBoard3D(container) {
   renderer.shadowMap.enabled = true;
   renderer.shadowMap.type = THREE.PCFSoftShadowMap;
   renderer.outputColorSpace = THREE.SRGBColorSpace;
+  renderer.toneMapping = THREE.ACESFilmicToneMapping;
+  renderer.toneMappingExposure = 1.06;
   container.appendChild(renderer.domElement);
+  setAnisotropy(renderer.capabilities.getMaxAnisotropy());
 
   scene = new THREE.Scene();
-  scene.background = new THREE.Color(0x140c07); // warm tavern dark
-  scene.fog = new THREE.Fog(0x140c07, 26, 70);
+  scene.background = new THREE.Color(0x0b0906);
+  scene.fog = new THREE.Fog(0x0b0906, 34, 96);
 
-  camera = new THREE.PerspectiveCamera(50, 1, 0.1, 200);
-  camera.position.set(CAM_POS.x - 5, CAM_POS.y + 5, CAM_POS.z - 5); // intro start
+  camera = new THREE.PerspectiveCamera(52, 1, 0.05, 260);
+  camera.position.set(CAM_POS.x - 8, CAM_POS.y + 9, CAM_POS.z - 8);
+
+  // the camera joins the scene graph so its attached UI children render
+  scene.add(camera);
 
   controls = new OrbitControls(camera, renderer.domElement);
   controls.target.copy(CAM_TGT);
   controls.enableDamping = true;
   controls.dampingFactor = 0.08;
-  controls.minDistance = 4;
-  controls.maxDistance = 32;
-  controls.maxPolarAngle = 1.35;
+  controls.minDistance = 3.2;
+  controls.maxDistance = 40;
+  controls.maxPolarAngle = 1.44;
+  controls.enablePan = false;
 
-  // camera-attached UI rig (HUD + dialogs stay readable while orbiting)
-  scene.add(camera);
-  uiRoot = new THREE.Group();
-  camera.add(uiRoot);
-  hudGroup = new THREE.Group();
-  dlgGroup = new THREE.Group();
-  rosterGroup = new THREE.Group();
-  uiRoot.add(hudGroup, dlgGroup, rosterGroup);
+  // ---- room + table ----
+  buildRoom(scene);
+  buildTable(scene);
 
-  scene.add(new THREE.HemisphereLight(0xffe2b8, 0x40260f, 0.55));
-  const sun = new THREE.DirectionalLight(0xffd9a8, 1.15);
-  sun.position.set(6, 14, 3);
+  // ---- lighting: chandelier key, candles, fireplace, moon through a window ----
+  scene.add(new THREE.HemisphereLight(0xffdcb0, 0x1a120a, 0.32));
+  scene.add(new THREE.AmbientLight(0xffd9a8, 0.16));
+  const sun = new THREE.DirectionalLight(0xffd2a0, 0.8);
+  sun.position.set(7, 16, 5);
   sun.castShadow = true;
   sun.shadow.mapSize.set(2048, 2048);
-  sun.shadow.camera.left = -8; sun.shadow.camera.right = 8;
-  sun.shadow.camera.top = 8; sun.shadow.camera.bottom = -8;
+  sun.shadow.camera.left = -14; sun.shadow.camera.right = 14;
+  sun.shadow.camera.top = 14; sun.shadow.camera.bottom = -14;
+  sun.shadow.bias = -0.0012;
+  sun.shadow.radius = 2;
   scene.add(sun);
+  const moon = new THREE.DirectionalLight(0x86b4ff, 0.34);
+  moon.position.set(-16, 10, -13);
+  scene.add(moon);
 
   GEO = {
     tile: new THREE.BoxGeometry(TILE, TILE_TOP, TILE),
@@ -111,7 +285,7 @@ export function initBoard3D(container) {
     die: new THREE.BoxGeometry(0.46, 0.46, 0.46),
   };
   Object.assign(MAT, {
-    side: new THREE.MeshStandardMaterial({ color: 0x1e293b, roughness: 0.8 }),
+    side: new THREE.MeshStandardMaterial({ color: 0x2b1e14, roughness: 0.85 }),
     house: new THREE.MeshStandardMaterial({ color: 0x22c55e, roughness: 0.6 }),
     hotel: new THREE.MeshStandardMaterial({ color: 0xdc2626, roughness: 0.6 }),
     roof: new THREE.MeshStandardMaterial({ color: 0xfbbf24, roughness: 0.4, metalness: 0.4 }),
@@ -119,65 +293,38 @@ export function initBoard3D(container) {
     pole: new THREE.MeshStandardMaterial({ color: 0xcbd5e1, roughness: 0.5 }),
   });
 
-  // ---- tavern: wooden table with green baize inlay, plank floor ----
-  const tableTex = woodTexture('#6b4423', '#452811');
-  tableTex.wrapS = tableTex.wrapT = THREE.RepeatWrapping;
-  tableTex.repeat.set(3, 3);
-  const table = new THREE.Mesh(
-    new THREE.BoxGeometry(14, 0.5, 14),
-    new THREE.MeshStandardMaterial({map: tableTex, roughness: 0.7})
-  );
-  table.position.y = -0.45; // top surface at y=-0.2
-  table.receiveShadow = true;
-  scene.add(table);
-  const legMat = new THREE.MeshStandardMaterial({color: 0x3d2410, roughness: 0.85});
-  for (const [lx, lz] of [[-6, -6], [6, -6], [-6, 6], [6, 6]]) {
-    const leg = new THREE.Mesh(new THREE.BoxGeometry(0.7, 5.3, 0.7), legMat);
-    leg.position.set(lx, -3.35, lz);
-    scene.add(leg);
-  }
-  // green baize playing surface the board sits on
-  const slab = new THREE.Mesh(
-    new THREE.BoxGeometry(8 * PITCH + 0.7, 0.2, 8 * PITCH + 0.7),
-    new THREE.MeshStandardMaterial({color: 0x14532d, roughness: 0.9})
-  );
-  slab.position.y = -0.1;
-  slab.receiveShadow = true;
-  scene.add(slab);
-  const floorTex = woodTexture('#4a2f18', '#2a1a0c');
-  floorTex.wrapS = floorTex.wrapT = THREE.RepeatWrapping;
-  floorTex.repeat.set(12, 12);
-  const ground = new THREE.Mesh(
-    new THREE.PlaneGeometry(90, 90),
-    new THREE.MeshStandardMaterial({map: floorTex, roughness: 0.95})
-  );
-  ground.rotation.x = -Math.PI / 2;
-  ground.position.y = -6;
-  ground.receiveShadow = true;
-  scene.add(ground);
-
-  // candle clusters on the table corners (2 real lights, 4x flames)
-  candleCluster(-5.6, -5.6, true);
-  candleCluster(5.6, -5.6, true);
-  candleCluster(-5.6, 5.6, false);
-  candleCluster(5.6, 5.6, false);
-  // fireplace glow from the west side
+  // ---- candles, chandelier, fireplace, props ----
+  chandelier(0, 8.2);
+  candleCluster(-5.2, -5.2, true);
+  candleCluster(5.2, -5.2, true);
+  candleCluster(-5.2, 5.2, false);
+  candleCluster(5.2, 5.2, false);
   buildFireplace();
-  // barrels + beer mugs for atmosphere
-  barrel(9.5, -9, 1.2);
-  barrel(11, -7.2, 0.9);
-  barrel(-10, 8.5, 1.1);
-  mug(6.3, 2.5);
-  mug(-2.5, 6.3);
+  window_(-13.5, 5.4, -6);
+  window_(13.5, 5.4, 6);
+  shelf(scene, -25.2, 4.2, 4, Math.PI / 2);
+  shelf(scene, -25.2, 5.5, 4, Math.PI / 2);
+  shelf(scene, 12, 4.4, -25.2, 0);
+  chalkboard(scene, 4, 5.2, -25.1, 0);
+  barrel(-9.5, -6, -9, 1.2);
+  barrel(-11.4, -6, -7.4, 0.9);
+  barrel(9.8, -6, 9.2, 1.15);
+  barrel(11.6, -6, 7.6, 0.95);
+  mug(5.1, -0.28, 2.2);
+  mug(-2.2, -0.28, 5.1);
+  mug(6.0, -0.28, -1.4);
+  cards(scene);
+  stepDust = dust(scene, flickers);
 
-  // tiles
+  // ---- tiles ----
   raycaster = new THREE.Raycaster();
   for (let i = 0; i < N; i++) {
     const { x, z } = tileXZ(i);
-    const topMat = new THREE.MeshStandardMaterial({ roughness: 0.7 });
+    const topMat = new THREE.MeshStandardMaterial({ roughness: 0.62 });
     const mesh = new THREE.Mesh(GEO.tile, [MAT.side, MAT.side, topMat, MAT.side, MAT.side, MAT.side]);
     mesh.position.set(x, TILE_TOP / 2, z);
     mesh.receiveShadow = true;
+    mesh.castShadow = true;
     mesh.userData.tileIndex = i;
     scene.add(mesh);
     tileMeshes.push({ mesh, topMat });
@@ -186,11 +333,10 @@ export function initBoard3D(container) {
     markerGroups.push(mg);
   }
 
-  // tokens (4 seats max): chunky pawns with a white collar so they pop
-  // against tiles and labels
-  const collarMat = new THREE.MeshStandardMaterial({color: 0xffffff, roughness: 0.5});
+  // ---- tokens: pawns with a floating name tag ----
+  const collarMat = new THREE.MeshStandardMaterial({ color: 0xffffff, roughness: 0.5 });
   for (let s = 0; s < 4; s++) {
-    const mat = new THREE.MeshStandardMaterial({color: 0xffffff, roughness: 0.35, emissive: 0x111111, emissiveIntensity: 0.4});
+    const mat = new THREE.MeshStandardMaterial({ color: 0xffffff, roughness: 0.35, emissive: 0x111111, emissiveIntensity: 0.4 });
     const g = new THREE.Group();
     const base = new THREE.Mesh(GEO.base, mat);
     base.position.y = 0.05;
@@ -204,31 +350,26 @@ export function initBoard3D(container) {
     g.userData.mat = mat;
     scene.add(g);
     tokenMeshes.push(g);
-    // floating name tag, glued to the token every frame (see animation loop)
-    const tag = new THREE.Sprite(new THREE.SpriteMaterial({transparent: true, depthTest: false}));
-    tag.scale.set(1.15, 1.15 * 80 / 256, 1);
-    tag.renderOrder = 998;
-    tag.visible = false;
-    scene.add(tag);
-    tokenTags.push(tag);
+    // no name sprite on the pawn: the seated character above already carries
+    // the name, and two labels per player is noise on a 28-tile board
   }
 
   // pulsing ring under the player whose turn it is
   turnRing = new THREE.Mesh(
-    new THREE.RingGeometry(0.3, 0.4, 32),
-    new THREE.MeshBasicMaterial({color: 0xfbbf24, transparent: true, opacity: 0.8, side: THREE.DoubleSide, depthTest: false})
+    new THREE.RingGeometry(0.3, 0.42, 32),
+    new THREE.MeshBasicMaterial({ color: 0xfbbf24, transparent: true, opacity: 0.8, side: THREE.DoubleSide, depthTest: false })
   );
   turnRing.rotation.x = -Math.PI / 2;
   turnRing.renderOrder = 999;
   turnRing.visible = false;
   scene.add(turnRing);
 
-  // dice (hidden until a roll); each die gets its own material set
+  // dice (hidden until a roll)
   const pipTex = [];
   for (let v = 1; v <= 6; v++) pipTex.push(pipTexture(v));
   for (let d = 0; d < 2; d++) {
     const mats = [];
-    for (let f = 0; f < 6; f++) mats.push(new THREE.MeshStandardMaterial({ roughness: 0.4 }));
+    for (let f = 0; f < 6; f++) mats.push(new THREE.MeshStandardMaterial({ roughness: 0.35 }));
     const m = new THREE.Mesh(GEO.die, mats);
     m.castShadow = true;
     m.visible = false;
@@ -237,13 +378,36 @@ export function initBoard3D(container) {
     diceMeshes.push(m);
   }
 
-  // click-to-inspect (also fills the fly destination box)
+  // ---- the four players, seated around the table ----
+  chars = buildCharacters(scene, 0);
+  syncCharNeck();
+
+  // ---- pointer: click a tile to inspect, click a character to ride ----
   let downXY = null;
-  renderer.domElement.addEventListener('pointerdown', e => { downXY = [e.clientX, e.clientY]; });
+  renderer.domElement.addEventListener('pointerdown', e => {
+    downXY = [e.clientX, e.clientY];
+    if (CAM.mode === 'seat' && !UI?.isDialogOpen?.()) { CAM.looking = true; CAM.lastX = e.clientX; CAM.lastY = e.clientY; }
+  });
+  renderer.domElement.addEventListener('pointermove', e => {
+    if (CAM.looking && CAM.mode === 'seat') {
+      CAM.yaw -= (e.clientX - CAM.lastX) * 0.005;
+      CAM.pitch = Math.max(-0.62, Math.min(0.5, CAM.pitch - (e.clientY - CAM.lastY) * 0.004));
+      CAM.lastX = e.clientX; CAM.lastY = e.clientY;
+    }
+    UI?.routeHover?.(e);
+  });
+  window.addEventListener('pointerup', () => { CAM.looking = false; });
+  renderer.domElement.addEventListener('wheel', e => {
+    if (CAM.mode !== 'seat') return;      // freecam: OrbitControls zooms
+    e.preventDefault();
+    CAM.zoom = Math.max(0, Math.min(1, CAM.zoom - Math.sign(e.deltaY) * 0.12));
+  }, { passive: false });
+
   renderer.domElement.addEventListener('pointerup', e => {
-    if (routeUIClick(e)) return; // dialog / HUD buttons eat the click first
-    if (!downXY || !tileClickCb || !lastState) return;
+    if (UI?.routeClick?.(e)) { downXY = null; return; }
+    if (!downXY) return;
     const dx = e.clientX - downXY[0], dy = e.clientY - downXY[1];
+    downXY = null;
     if (dx * dx + dy * dy > 36) return;
     const r = renderer.domElement.getBoundingClientRect();
     const ptr = new THREE.Vector2(
@@ -251,13 +415,30 @@ export function initBoard3D(container) {
       -((e.clientY - r.top) / r.height) * 2 + 1
     );
     raycaster.setFromCamera(ptr, camera);
-    const hit = raycaster.intersectObjects(tileMeshes.map(t => t.mesh))[0];
-    if (hit) tileClickCb(hit.object.userData.tileIndex, lastState);
+    if (!lastState) return;
+    // one raycast over tiles and characters: whichever is genuinely nearer
+    // wins, so a character never steals a click meant for a tile beside it
+    const targets = tileMeshes.map(t => t.mesh).concat(chars.map(c => c.pick));
+    const hit = raycaster.intersectObjects(targets, false)[0];
+    if (!hit) return;
+    if (hit.object.userData.seat !== undefined && seatClickCb) {
+      seatClickCb(hit.object.userData.seat);
+    } else if (hit.object.userData.tileIndex !== undefined && tileClickCb) {
+      tileClickCb(hit.object.userData.tileIndex, lastState);
+    }
   });
+
+  window.addEventListener('keydown', e => {
+    const tag = (e.target && e.target.tagName) || '';
+    if (tag === 'INPUT' || tag === "SELECT" || tag === "TEXTAREA") return;
+    if (e.key === ' ') e.preventDefault();
+    CAM.keys[e.key] = true;
+    if (e.key === 'ArrowUp' || e.key === 'ArrowDown' || e.key === 'ArrowLeft' || e.key === 'ArrowRight') e.preventDefault();
+  });
+  window.addEventListener('keyup', e => { CAM.keys[e.key] = false; });
 
   new ResizeObserver(() => resize3D()).observe(container);
   resize3D();
-  renderer.domElement.addEventListener('pointermove', routeUIHover);
 
   // gentle intro dolly into the Start-corner view
   const p0 = camera.position.clone(), p1 = CAM_POS.clone();
@@ -266,74 +447,89 @@ export function initBoard3D(container) {
     camera.position.lerpVectors(p0, p1, e);
   });
 
+  let last = performance.now();
   renderer.setAnimationLoop(() => {
-    stepTweens();
-    // candle + fireplace flicker
-    const ft = performance.now() / 1000;
-    for (const f of flickers) {
-      if (f.light) {
-        f.light.intensity = f.base
-          + Math.sin(ft * f.speed) * f.amp * 0.35
-          + Math.sin(ft * f.speed * 2.7 + 1.3) * f.amp * 0.2;
-      }
-      const fs = 1 + 0.1 * Math.sin(ft * 11 + f.speed) + 0.05 * Math.sin(ft * 23 + f.speed * 2);
-      for (const fl of f.flames) fl.s.scale.set(fl.bx * fs, fl.by * (2 - fs), 1);
-    }
+    const now = performance.now();
+    const dt = Math.min(0.05, (now - last) / 1000);
+    last = now;
+    const t = now / 1000;
+    // real elapsed time, so animations keep their wall-clock duration even
+    // when the GPU is slow and frames are rare
+    stepTweens(Math.min(0.1, dt));
+    stepFlickers(t);
+    if (stepDust) stepDust(t);
     if (targeting) { // pulse all flyable tiles
-      const k = 0.35 + 0.3 * Math.sin(performance.now() / 240);
-      tileMeshes.forEach((t, i) => {
+      const k = 0.35 + 0.3 * Math.sin(now / 240);
+      tileMeshes.forEach((t2, i) => {
         if (i === ISLAND_TILE) return;
-        t.topMat.emissive.setHex(0x005577);
-        t.topMat.emissiveIntensity = k;
+        t2.topMat.emissive.setHex(0x005577);
+        t2.topMat.emissiveIntensity = k;
       });
     }
-    // name tags ride their tokens (even mid-hop); turn ring pulses under current
-    for (let s = 0; s < tokenMeshes.length; s++) {
-      const tk = tokenMeshes[s], tag = tokenTags[s];
-      tag.visible = tk.visible;
-      if (tk.visible) tag.position.set(tk.position.x, tk.position.y + 1.0, tk.position.z);
-    }
+    // the turn ring pulses under whoever is about to roll
     if (turnRing) {
       const tk = tokenMeshes[currentSeat];
       turnRing.visible = !!tk && tk.visible;
       if (turnRing.visible) {
         turnRing.position.set(tk.position.x, tk.position.y + 0.03, tk.position.z);
-        turnRing.material.opacity = 0.55 + 0.35 * Math.sin(performance.now() / 300);
+        turnRing.material.opacity = 0.55 + 0.35 * Math.sin(now / 300);
       }
     }
-    // money eye candy: panel flash+pop, then rising +/- tickers
-    const nowFx = performance.now();
-    moneyFx = moneyFx.filter(fx => {
-      const k = (nowFx - fx.start) / 700;
-      const m = rosterPanels.find(r => r.seat === fx.seat);
-      if (k >= 1) {
-        if (m) { m.mesh.material.color.setHex(0xffffff); m.mesh.scale.setScalar(1); }
-        return false;
-      }
-      if (m) {
-        m.mesh.material.color.setHex(fx.tint).lerp(WHITE_TMP, k);
-        m.mesh.scale.setScalar(1 + 0.12 * Math.sin(Math.PI * Math.min(1, k * 1.6)));
-      }
-      return true;
-    });
-    floaters = floaters.filter(f => {
-      const k = (nowFx - f.start) / f.dur;
-      if (k >= 1) {
-        if (f.sprite.parent) f.sprite.parent.remove(f.sprite);
-        f.sprite.material.map.dispose();
-        f.sprite.material.dispose();
-        return false;
-      }
-      f.sprite.position.y = f.y0 + k * 0.9;
-      f.sprite.material.opacity = k < 0.55 ? 1 : 1 - (k - 0.55) / 0.45;
-      return true;
-    });
+    updateCamera(dt);
+    updatePlateFade();
+    stepCharacters(chars, t, CAM.mode === 'seat' ? null : camera.position, dt);
+    stepConfetti(dt);
+    UI?.step?.(now);
     controls.update();
     renderer.render(scene, camera);
   });
   ready = true;
 }
 
+// ---------------- per-frame camera ----------------
+function updateCamera(dt) {
+  if (CAM.mode === 'seat') {
+    // keyboard look (locked while a modal dialog owns the view)
+    const sp = 1.6 * dt;
+    const k = CAM.keys;
+    if (!UI?.isDialogOpen?.()) {
+      if (k.ArrowLeft || k.a) CAM.yaw += sp;
+      if (k.ArrowRight || k.d) CAM.yaw -= sp;
+      if (k.ArrowUp || k.w) CAM.pitch = Math.min(0.5, CAM.pitch + sp * 0.7);
+      if (k.ArrowDown || k.s) CAM.pitch = Math.max(-0.62, CAM.pitch - sp * 0.7);
+    }
+    // seated pose: eye at the character, looking where we steer
+    const eye = seatEye(CAM.seat, TMP_V);
+    seatDir(TMP_V2);
+    const target = eye.clone().add(TMP_V2.clone().multiplyScalar(8));
+    TMP_M.lookAt(eye, target, camera.up);
+    TMP_Q.setFromRotationMatrix(TMP_M);
+    camera.position.lerpVectors(CAM.freePos, eye, CAM.blend);
+    camera.quaternion.slerpQuaternions(CAM.freeQuat, TMP_Q, CAM.blend);
+    // the ridden character's head mirrors our look direction
+    const c = chars[CAM.seat];
+    if (c) {
+      let yaw = CAM.yaw - c.spot.yaw;
+      yaw = Math.atan2(Math.sin(yaw), Math.cos(yaw));
+      c.headYaw = yaw;
+      c.headPitch = Math.max(-0.42, Math.min(0.3, -CAM.pitch));
+    }
+  } else if (CAM.blend > 0) {
+    // blending back out to the freecam pose
+    camera.position.lerpVectors(seatEye(CAM.seat, TMP_V), CAM.freePos, 1 - CAM.blend);
+  } else if (controls.enabled) {
+    // never let the orbit camera rise through the tavern ceiling, and keep it
+    // over the table so the room stays framed
+    const r = Math.hypot(camera.position.x, camera.position.z);
+    if (r > 21) {
+      camera.position.x *= 21 / r;
+      camera.position.z *= 21 / r;
+    }
+    if (camera.position.y > 11.5) camera.position.y = 11.5;
+  }
+}
+
+// ---------------- resize / view ----------------
 export function resize3D() {
   if (!ready) return;
   const el = renderer.domElement.parentElement;
@@ -341,12 +537,12 @@ export function resize3D() {
   renderer.setSize(w, h);
   camera.aspect = w / h;
   camera.updateProjectionMatrix();
-  layoutHUD(); // re-fit HUD to the new aspect
-  layoutRoster(); // re-pin corner panels
+  UI?.onResize?.(w, h);
 }
 
 export function resetView3D() {
   if (!ready) return;
+  if (CAM.mode === 'seat') { setCameraMode3D('free'); return; }
   const p0 = camera.position.clone(), t0 = controls.target.clone();
   tween(0.8, k => {
     const e = 1 - Math.pow(1 - k, 3);
@@ -356,15 +552,40 @@ export function resetView3D() {
 }
 
 export function onTileClick3D(cb) { tileClickCb = cb; }
+export function onSeatClick3D(cb) { seatClickCb = cb; }
+export function getRenderer3D() { return renderer; }
+export function getCamera3D() { return camera; }
+// The tile tops carry the numbers that matter (price / rent / level), so the
+// floating name plates are a labels-on switch, not the default. They also fade
+// out as the camera closes in: up close they would swamp the view.
+const PLATE_FADE = [11, 17];   // distance range over which they appear
+function updatePlateFade() {
+  if (!ready) return;
+  for (const sp of plateSprites) {
+    if (!sp) continue;
+    if (!platesVisible) { sp.visible = false; continue; }
+    const d = camera.position.distanceTo(sp.position);
+    const a = THREE.MathUtils.clamp((d - PLATE_FADE[0]) / (PLATE_FADE[1] - PLATE_FADE[0]), 0, 1);
+    sp.visible = a > 0.03;
+    sp.material.opacity = a;
+  }
+}
 
-// ---------- tiny tween engine (driven by the render loop) ----------
+export function setPlatesVisible3D(v) {
+  platesVisible = v;
+  updatePlateFade();
+}
+
+// The full per-tile label, used when the labels switch is on.
+export function getPlatesVisible3D() { return platesVisible; }
+
+// ---------------- tiny tween engine (driven by the render loop) ----------
 let tweens = [];
 function tween(dur, update) {
   return new Promise(res => tweens.push({ t: 0, dur, update, res }));
 }
-function stepTweens() {
+function stepTweens(dt) {
   if (!tweens.length) return;
-  const dt = 1 / 60;
   tweens = tweens.filter(tw => {
     tw.t += dt;
     const k = Math.min(1, tw.t / tw.dur);
@@ -375,146 +596,12 @@ function stepTweens() {
 }
 const wait = ms => new Promise(r => setTimeout(r, ms));
 
-// ---------- canvas textures ----------
-function canvasTex(size, draw) {
-  const c = document.createElement('canvas');
-  c.width = c.height = size;
-  draw(c.getContext('2d'), size);
-  const t = new THREE.CanvasTexture(c);
-  t.colorSpace = THREE.SRGBColorSpace;
-  t.anisotropy = 4;
-  return t;
-}
-
-function tileTexture(t, owner) {
-  const band = t.type === "property"
-    ? '#' + GROUP_COLORS[t.group].toString(16).padStart(6, '0')
-    : '#' + (SPECIAL_COLORS[t.type] ?? 0x64748b).toString(16).padStart(6, '0');
-  // 512px canvas + oversized bold type: stays legible at glancing angles,
-  // and carries the name so tiles read with plates toggled off
-  return canvasTex(512, (ctx, S) => {
-    ctx.fillStyle = '#f8fafc';
-    ctx.fillRect(0, 0, S, S);
-    ctx.fillStyle = band;
-    ctx.fillRect(0, 0, S, 110);
-    ctx.fillStyle = '#fff';
-    ctx.font = 'bold 64px system-ui,sans-serif';
-    ctx.fillText(`${t.index}`, 24, 80);
-    ctx.textAlign = 'right';
-    ctx.fillText(`S${t.side}`, S - 24, 80);
-    ctx.textAlign = 'left';
-    ctx.fillStyle = '#0f172a';
-    ctx.font = 'bold 54px system-ui,sans-serif';
-    const words = t.name.split(' ');
-    const lines = [];
-    let cur = '';
-    for (const w of words) {
-      if ((cur + ' ' + w).trim().length > 10) { lines.push(cur.trim()); cur = w; }
-      else cur += ' ' + w;
-    }
-    lines.push(cur.trim());
-    lines.slice(0, 2).forEach((ln, k) => ctx.fillText(ln, 24, 185 + k * 62));
-    let y = 330;
-    if (t.type === 'property') {
-      ctx.fillStyle = '#15803d';
-      ctx.font = 'bold 62px system-ui,sans-serif';
-      if (t.price) { ctx.fillText(`$${t.price}`, 24, y); y += 72; }
-      if (t.rent != null) {
-        ctx.fillStyle = '#b45309';
-        ctx.fillText(`rent $${t.rent}`, 24, y);
-      }
-    } else {
-      ctx.fillStyle = '#334155';
-      ctx.font = 'bold 46px system-ui,sans-serif';
-      const label = TYPE_SHORT[t.type] || t.type;
-      const w2 = label.split(' ');
-      const l2 = [];
-      let c2 = '';
-      for (const w of w2) {
-        if ((c2 + ' ' + w).trim().length > 12) { l2.push(c2.trim()); c2 = w; }
-        else c2 += ' ' + w;
-      }
-      l2.push(c2.trim());
-      l2.slice(0, 2).forEach((ln, k) => ctx.fillText(ln, 24, 330 + k * 56));
-    }
-    if (owner) {
-      ctx.fillStyle = owner.color;
-      ctx.fillRect(0, S - 72, S, 72);
-      ctx.fillStyle = '#fff';
-      ctx.font = 'bold 42px system-ui,sans-serif';
-      ctx.fillText(owner.name.slice(0, 12), 24, S - 20);
-    }
-  });
-}
-
-const TYPE_SHORT = {
-  go: 'START +$200', chance: 'CHANCE', tax_agency: 'TAX · 10% NET',
-  island: 'LOST ISLAND', tour: 'WORLD TOUR', championship: 'CHAMPIONSHIP',
-  sender: 'STORM → ISLAND',
-};
-
-function segmentsLine(ctx, segs, cx, y, font) {
-  ctx.font = font;
-  const widths = segs.map(s => ctx.measureText(s.text).width);
-  let x = cx - widths.reduce((a, b) => a + b, 0) / 2;
-  const prev = ctx.textAlign;
-  ctx.textAlign = 'left';
-  segs.forEach((s, k) => { ctx.fillStyle = s.color; ctx.fillText(s.text, x, y); x += widths[k]; });
-  ctx.textAlign = prev;
-}
-
-// Floating name plate: a sprite always faces the camera, so every city is
-// readable from the Start-corner view (and any orbit angle).
-function labelSprite(t, owner) {
-  const band = t.type === 'property'
-    ? '#' + GROUP_COLORS[t.group].toString(16).padStart(6, '0')
-    : '#' + (SPECIAL_COLORS[t.type] ?? 0x64748b).toString(16).padStart(6, '0');
-  const tex = rectTex(512, 224, (ctx, W, H) => {
-    ctx.clearRect(0, 0, W, H);
-    ctx.fillStyle = 'rgba(2,6,23,0.88)';
-    rr(ctx, 4, 4, W - 8, H - 8, 40);
-    ctx.fill();
-    ctx.strokeStyle = band;
-    ctx.lineWidth = 10;
-    rr(ctx, 10, 10, W - 20, H - 20, 32);
-    ctx.stroke();
-    ctx.textAlign = 'center';
-    ctx.fillStyle = '#fff';
-    ctx.font = 'bold 56px system-ui,sans-serif';
-    ctx.fillText(t.name.slice(0, 20), W / 2, 86);
-    let segs;
-    if (t.type === 'property') {
-      segs = [];
-      if (t.level === 4) segs.push({text: 'HOTEL ', color: '#fbbf24'});
-      else if (t.level > 0) segs.push({text: `Lv${t.level} `, color: '#4ade80'});
-      if (owner) {
-        segs.push({text: `rent $${t.rent}`, color: '#fbbf24'});
-        segs.push({text: ' · ', color: '#64748b'});
-        segs.push({text: owner.name.slice(0, 10), color: owner.color});
-      } else {
-        segs.push({text: `$${t.price}`, color: '#4ade80'});
-      }
-      if (t.boost) segs.push({text: ` ★${t.boost}`, color: '#fbbf24'});
-    } else {
-      segs = [{text: TYPE_SHORT[t.type] || t.type, color: '#cbd5e1'}];
-    }
-    segmentsLine(ctx, segs, W / 2, 170, '46px system-ui,sans-serif');
-  });
-  const sp = new THREE.Sprite(new THREE.SpriteMaterial({map: tex, transparent: true}));
-  sp.scale.set(1.9, 1.9 * 224 / 512, 1);
-  // push the plate outward from board center so tile middles stay clear for tokens
-  const {x, z} = tileXZ(t.index);
-  const ol = Math.hypot(x, z) || 1;
-  sp.position.set(x + (x / ol) * 0.95, 1.28, z + (z / ol) * 0.95);
-  return sp;
-}
-
+// ---------------- canvas textures ----------------
 function pipTexture(v) {
-  return canvasTex(128, (ctx, S) => {
+  return tex2d(128, (ctx, S) => {
     ctx.fillStyle = '#f8fafc';
     ctx.beginPath();
-    if (ctx.roundRect) ctx.roundRect(0, 0, S, S, 22);
-    else ctx.rect(0, 0, S, S);
+    if (ctx.roundRect) ctx.roundRect(0, 0, S, S, 22); else ctx.rect(0, 0, S, S);
     ctx.fill();
     ctx.fillStyle = '#0f172a';
     const P = [[0.5, 0.5], [0.28, 0.28], [0.72, 0.72], [0.72, 0.28], [0.28, 0.72], [0.28, 0.5], [0.72, 0.5]];
@@ -527,32 +614,211 @@ function pipTexture(v) {
   });
 }
 
-function centerTexture(state) {
-  return canvasTex(512, (ctx, S) => {
-    ctx.fillStyle = '#14532d';
-    ctx.fillRect(0, 0, S, S);
-    ctx.strokeStyle = '#fbbf24';
-    ctx.lineWidth = 10;
-    ctx.strokeRect(18, 18, S - 36, S - 36);
-    ctx.fillStyle = '#fbbf24';
-    ctx.textAlign = 'center';
-    ctx.font = 'bold 72px system-ui,sans-serif';
-    ctx.fillText('MONOPOLY', S / 2, S / 2 - 30);
-    ctx.fillStyle = '#fff';
-    ctx.font = '30px system-ui,sans-serif';
-    ctx.fillText(`round ${state.round} · hotel R${state.hotelUnlockRound}`, S / 2, S / 2 + 30);
-    ctx.fillText(`resorts: ${state.constants.resortTiles.join(', ')}`, S / 2, S / 2 + 72);
+function wrapText(ctx, text, maxW) {
+  const words = String(text).split(' ');
+  const lines = [];
+  let cur = '';
+  for (const w of words) {
+    if (ctx.measureText((cur + ' ' + w).trim()).width > maxW && cur) { lines.push(cur.trim()); cur = w; }
+    else cur += ' ' + w;
+  }
+  if (cur.trim()) lines.push(cur.trim());
+  return lines;
+}
+
+// Each side of the board is read from the player sitting at it, so the tile
+// artwork is spun to face outward. Rotating the map (not the mesh) keeps the
+// text crisp and lets the same geometry serve every tile.
+//
+// From the box's top face: uv-u runs along +x, uv-v along -z. With three's
+// uv transform, content-right lands on (cos θ, sin θ) in (x, z) and
+// content-up on (-sin θ, -cos θ). Solving for each seat's read direction:
+//   north row -> 180°,  south row -> 0°,  west column -> 90°,  east -> -90°.
+function tileFacing(i) {
+  const { col, row } = tileColRow(i);
+  if (row === 0) return Math.PI;
+  if (row === 7) return 0;
+  if (col === 0) return Math.PI / 2;
+  return -Math.PI / 2;
+}
+
+// The printed tile top is the readable surface at table distance: big sticker
+// price, index, side, group band, owner strip. The rent an individual owes
+// depends on houses, boosts and who steps on it, so it is deliberately NOT
+// printed here — each player's holdings panel shows what *they* would pay.
+function tileTexture(t, owner) {
+  const band = '#' + (t.type === 'property' ? GROUP_COLORS[t.group] : (SPECIAL_COLORS[t.type] ?? 0x64748b))
+    .toString(16).padStart(6, '0');
+  return tex2d(1024, 1024, (ctx, S) => {
+    // paper
+    ctx.fillStyle = '#fbf8f1'; ctx.fillRect(0, 0, S, S);
+    const gr = ctx.createLinearGradient(0, 0, S, S);
+    gr.addColorStop(0, 'rgba(255,255,255,0.9)');
+    gr.addColorStop(1, 'rgba(210,200,180,0.55)');
+    ctx.fillStyle = gr; ctx.fillRect(0, 0, S, S);
+    // group band
+    ctx.fillStyle = band; ctx.fillRect(0, 0, S, 216);
+    ctx.fillStyle = 'rgba(255,255,255,0.18)'; ctx.fillRect(0, 0, S, 60);
+    // index + side, big and legible
+    ctx.fillStyle = '#ffffff';
+    ctx.font = '800 132px system-ui,sans-serif';
+    ctx.textAlign = 'left';
+    ctx.fillText(String(t.index), 34, 152);
+    ctx.font = '800 72px system-ui,sans-serif';
+    ctx.textAlign = 'right';
+    ctx.fillText(`SIDE ${t.side}`, S - 34, 100);
+    if (t.type === 'property') {
+      ctx.font = '700 58px system-ui,sans-serif';
+      ctx.fillText((GROUP_NAMES[t.group] || '').slice(0, 10), S - 34, 172);
+    }
+    ctx.textAlign = 'left';
+    // name
+    ctx.fillStyle = '#0b1220';
+    ctx.font = '800 116px system-ui,sans-serif';
+    const nameLines = wrapText(ctx, t.name.toUpperCase(), S - 72).slice(0, 2);
+    nameLines.forEach((ln, k) => {
+      const y = 216 + 132 + k * 122;
+      ctx.lineWidth = 14; ctx.strokeStyle = '#ffffff'; ctx.lineJoin = 'round';
+      ctx.strokeText(ln, 36, y);
+      ctx.fillText(ln, 36, y);
+    });
+    if (t.type === 'property') {
+      let y = 216 + 132 + nameLines.length * 122 + 30;
+      ctx.strokeStyle = '#cbd5e1'; ctx.lineWidth = 8;
+      ctx.beginPath(); ctx.moveTo(36, y - 96); ctx.lineTo(S - 36, y - 96); ctx.stroke();
+      // only the sticker price is printed on the tile: what a tenant actually
+      // pays changes with houses, boosts and who steps on it, so that lives in
+      // the player's holdings panel instead of on the board
+      ctx.fillStyle = '#166534';
+      ctx.font = '800 168px system-ui,sans-serif';
+      ctx.fillText(`$${t.price}`, 36, y + 72);
+      ctx.fillStyle = '#64748b';
+      ctx.font = '800 62px system-ui,sans-serif';
+      ctx.fillText('STICKER PRICE', 36, y + 156);
+      if (t.level) {
+        ctx.fillStyle = t.level >= 4 ? '#b91c1c' : '#15803d';
+        ctx.font = '800 84px system-ui,sans-serif';
+        ctx.fillText(t.level >= 4 ? '🏨 HOTEL' : `HOMES Lv${t.level}`, 36, y + 254);
+      }
+    } else {
+      const [glyph, title, sub] = TYPE_INFO[t.type] || ['?', t.type.toUpperCase(), ''];
+      let y = 216 + 132 + nameLines.length * 122 + 40;
+      ctx.textAlign = 'center';
+      ctx.fillStyle = band;
+      ctx.font = '800 250px system-ui,sans-serif';
+      ctx.fillText(glyph, S / 2, y + 96);
+      ctx.fillStyle = '#0b1220';
+      ctx.font = '800 96px system-ui,sans-serif';
+      ctx.fillText(title, S / 2, y + 210);
+      if (sub) {
+        ctx.fillStyle = '#475569';
+        ctx.font = '700 70px system-ui,sans-serif';
+        ctx.fillText(sub, S / 2, y + 292);
+      }
+      ctx.textAlign = 'left';
+    }
+    // owner strip
+    if (owner) {
+      ctx.fillStyle = owner.color; ctx.fillRect(0, S - 116, S, 116);
+      ctx.fillStyle = 'rgba(0,0,0,0.18)'; ctx.fillRect(0, S - 116, S, 12);
+      ctx.fillStyle = '#ffffff';
+      ctx.font = '800 78px system-ui,sans-serif';
+      ctx.textAlign = 'center';
+      ctx.fillText(owner.name.slice(0, 12).toUpperCase(), S / 2, S - 36);
+      ctx.textAlign = 'left';
+    }
   });
 }
 
-// ---------- state rendering ----------
+function segmentsLine(ctx, segs, cx, y, font) {
+  ctx.font = font;
+  const widths = segs.map(s => ctx.measureText(s.text).width);
+  let x = cx - widths.reduce((a, b) => a + b, 0) / 2;
+  const prev = ctx.textAlign;
+  ctx.textAlign = 'left';
+  segs.forEach((s, k) => { ctx.fillStyle = s.color; ctx.fillText(s.text, x, y); x += widths[k]; });
+  ctx.textAlign = prev;
+}
 
-const flickers = []; // candle/fireplace flicker: {light, base, amp, speed, flames:[{s,bx,by}]}
+// Camera-facing name plate above every tile.
+function labelSprite(t, owner) {
+  const band = '#' + (t.type === 'property' ? GROUP_COLORS[t.group] : (SPECIAL_COLORS[t.type] ?? 0x64748b))
+    .toString(16).padStart(6, '0');
+  const tex = tex2d(512, 260, (ctx, W, H) => {
+    ctx.clearRect(0, 0, W, H);
+    ctx.fillStyle = 'rgba(4,8,18,0.9)';
+    roundRect(ctx, 4, 4, W - 8, H - 8, 42); ctx.fill();
+    ctx.strokeStyle = band; ctx.lineWidth = 12;
+    roundRect(ctx, 10, 10, W - 20, H - 20, 34); ctx.stroke();
+    ctx.textAlign = 'center';
+    ctx.fillStyle = '#ffffff';
+    ctx.font = '800 54px system-ui,sans-serif';
+    ctx.fillText(t.name.slice(0, 20), W / 2, 76);
+    let segs;
+    if (t.type === 'property') {
+      // owner and build level only: the rent that applies to *you* is shown in
+      // your holdings panel, since it differs per player and per moment
+      segs = [];
+      if (t.level === 4) segs.push({ text: 'HOTEL ', color: '#fbbf24' });
+      else if (t.level > 0) segs.push({ text: `Lv${t.level} `, color: '#4ade80' });
+      if (owner) {
+        segs.push({ text: owner.name.slice(0, 10), color: owner.color });
+      } else {
+        segs.push({ text: `FOR SALE $${t.price}`, color: '#4ade80' });
+      }
+      if (t.boost) segs.push({ text: ` ★${t.boost}`, color: '#fbbf24' });
+    } else {
+      segs = [{ text: `${TYPE_INFO[t.type]?.[0] || ''} ${TYPE_INFO[t.type]?.[1] || t.type}`.trim(), color: '#e2e8f0' }];
+    }
+    segmentsLine(ctx, segs, W / 2, 156, 'bold 46px system-ui,sans-serif');
+    ctx.fillStyle = '#94a3b8';
+    ctx.font = '600 36px system-ui,sans-serif';
+    const sub = t.type === 'property'
+      ? `${GROUP_NAMES[t.group] || ''} · side ${t.side}`
+      : (TYPE_INFO[t.type]?.[2] || '');
+    ctx.fillText(sub, W / 2, 214);
+  });
+  const sp = new THREE.Sprite(new THREE.SpriteMaterial({
+    map: tex, transparent: true, depthWrite: false, opacity: 1,
+  }));
+  sp.scale.set(1.55, 1.55 * 260 / 512, 1);
+  const { x, z } = tileXZ(t.index);
+  const ol = Math.hypot(x, z) || 1;
+  sp.position.set(x + (x / ol) * 0.98, 1.32, z + (z / ol) * 0.98);
+  return sp;
+}
+// The felt logo. The round, dice and timer live in the top slate, so this is a
+// fixed, undistorted mark: built once, never rebuilt.
+const CENTER_LOGO = 470;
+
+function centerTexture() {
+  const S = 512;
+  return tex2d(S, CENTER_LOGO, (ctx, C) => {
+    ctx.fillStyle = '#14532d'; ctx.fillRect(0, 0, C, CENTER_LOGO);
+    const g = ctx.createRadialGradient(C / 2, C / 2, 20, C / 2, C / 2, C / 2);
+    g.addColorStop(0, 'rgba(255,255,255,0.10)');
+    g.addColorStop(1, 'rgba(0,0,0,0.30)');
+    ctx.fillStyle = g; ctx.fillRect(0, 0, C, C);
+    ctx.strokeStyle = '#fbbf24'; ctx.lineWidth = 12;
+    ctx.strokeRect(22, 22, C - 44, C - 44);
+    ctx.strokeStyle = 'rgba(251,191,36,0.4)'; ctx.lineWidth = 4;
+    ctx.strokeRect(40, 40, C - 80, C - 80);
+    ctx.fillStyle = '#fbbf24'; ctx.textAlign = 'center';
+    ctx.font = '800 84px Georgia,serif';
+    ctx.fillText('CITIES', C / 2, 200);
+    ctx.fillText('OF THE WORLD', C / 2, 290);
+    ctx.fillStyle = 'rgba(255,255,255,0.6)';
+    ctx.font = '600 30px system-ui,sans-serif';
+    ctx.fillText('ROLL · MOVE · PAY RENT', C / 2, 350);
+  });
+}
+
+// ---------------- lights + props ----------------
+const flickers = [];   // {light, base, amp, speed, flames:[{s,bx,by}]}
 
 function woodTexture(base, dark) {
-  return canvasTex(512, (ctx, S) => {
-    ctx.fillStyle = base;
-    ctx.fillRect(0, 0, S, S);
+  return tex2d(512, (ctx, S) => {
+    ctx.fillStyle = base; ctx.fillRect(0, 0, S, S);
     const rows = 6;
     for (let r = 0; r < rows; r++) {
       const y = (r * S) / rows;
@@ -567,25 +833,22 @@ function woodTexture(base, dark) {
         for (let x = 0; x <= S; x += 32) ctx.lineTo(x, gy + Math.sin(x * 0.02 + gl) * 3 + (Math.random() - 0.5) * 3);
         ctx.stroke();
       }
-      ctx.fillStyle = dark;
-      ctx.globalAlpha = 0.55;
-      ctx.fillRect(0, y, S, 3);
-      ctx.globalAlpha = 1;
+      ctx.fillStyle = dark; ctx.globalAlpha = 0.55;
+      ctx.fillRect(0, y, S, 3); ctx.globalAlpha = 1;
     }
-  });
+  }, { repeat: [3, 3] });
 }
 
 let _flameTex = null;
 function flameTexture() {
   if (_flameTex) return _flameTex;
-  _flameTex = canvasTex(128, (ctx, S) => {
+  _flameTex = tex2d(128, (ctx, S) => {
     const g = ctx.createRadialGradient(S / 2, S * 0.62, 4, S / 2, S * 0.55, S * 0.5);
     g.addColorStop(0, 'rgba(255,240,200,1)');
     g.addColorStop(0.35, 'rgba(255,180,80,0.9)');
     g.addColorStop(0.7, 'rgba(230,90,20,0.45)');
     g.addColorStop(1, 'rgba(120,30,0,0)');
-    ctx.fillStyle = g;
-    ctx.fillRect(0, 0, S, S);
+    ctx.fillStyle = g; ctx.fillRect(0, 0, S, S);
   });
   return _flameTex;
 }
@@ -596,17 +859,54 @@ function flameSprite(bx, by) {
   }));
   f.scale.set(bx, by, 1);
   f.renderOrder = 5;
-  return {s: f, bx, by};
+  return { s: f, bx, by };
+}
+
+// hanging light over the table: iron ring + candles + warm key light
+function chandelier(x, y) {
+  const g = new THREE.Group();
+  const iron = new THREE.MeshStandardMaterial({ color: 0x22201e, metalness: 0.7, roughness: 0.45 });
+  const chain = new THREE.Mesh(new THREE.CylinderGeometry(0.05, 0.05, 4.2, 8), iron);
+  chain.position.y = 3.4;
+  g.add(chain);
+  const ring = new THREE.Mesh(new THREE.TorusGeometry(1.5, 0.09, 10, 32), iron);
+  ring.rotation.x = Math.PI / 2;
+  g.add(ring);
+  const ring2 = new THREE.Mesh(new THREE.TorusGeometry(0.85, 0.07, 10, 24), iron);
+  ring2.rotation.x = Math.PI / 2;
+  ring2.position.y = 0.55;
+  g.add(ring2);
+  const wax = new THREE.MeshStandardMaterial({ color: 0xf3e5c3, roughness: 0.6 });
+  const flames = [];
+  for (let i = 0; i < 6; i++) {
+    const a = (i / 6) * Math.PI * 2;
+    const cx = Math.cos(a) * 1.5, cz = Math.sin(a) * 1.5;
+    const c = new THREE.Mesh(new THREE.CylinderGeometry(0.08, 0.09, 0.4, 10), wax);
+    c.position.set(cx, 0.2, cz);
+    const fl = flameSprite(0.26, 0.4);
+    fl.s.position.set(cx, 0.55, cz);
+    g.add(c, fl.s);
+    flames.push(fl);
+  }
+  const key = new THREE.PointLight(0xffb257, 42, 26, 2);
+  key.position.set(0, 0.9, 0);
+  key.castShadow = true;
+  key.shadow.mapSize.set(1024, 1024);
+  key.shadow.bias = -0.004;
+  g.add(key);
+  g.position.set(x, y, 0);
+  scene.add(g);
+  flickers.push({ light: key, base: 42, amp: 5, speed: 6, flames });
 }
 
 function candleCluster(x, z, withLight) {
   const grp = new THREE.Group();
-  const brass = new THREE.MeshStandardMaterial({color: 0x8a6d2f, metalness: 0.7, roughness: 0.35});
-  const wax = new THREE.MeshStandardMaterial({color: 0xf3e5c3, roughness: 0.6});
+  const brass = new THREE.MeshStandardMaterial({ color: 0x8a6d2f, metalness: 0.7, roughness: 0.35 });
+  const wax = new THREE.MeshStandardMaterial({ color: 0xf3e5c3, roughness: 0.6 });
   const tray = new THREE.Mesh(new THREE.CylinderGeometry(0.5, 0.55, 0.08, 20), brass);
   tray.position.y = 0.04;
   grp.add(tray);
-  const entry = {light: null, base: 0, amp: 0, speed: 9 + Math.random() * 4, flames: []};
+  const entry = { light: null, base: 0, amp: 0, speed: 9 + Math.random() * 4, flames: [] };
   [0.5, 0.78, 0.36].forEach((h, i) => {
     const a = (i / 3) * Math.PI * 2;
     const cx = Math.cos(a) * 0.2, cz = Math.sin(a) * 0.2;
@@ -620,103 +920,99 @@ function candleCluster(x, z, withLight) {
     entry.flames.push(fl);
   });
   if (withLight) {
-    const pl = new THREE.PointLight(0xff9a3c, 14, 14, 2);
+    const pl = new THREE.PointLight(0xff9a3c, 11, 13, 2);
     pl.position.set(0, 1.4, 0);
     grp.add(pl);
-    entry.light = pl;
-    entry.base = 14;
-    entry.amp = 3.5;
+    entry.light = pl; entry.base = 11; entry.amp = 3;
   }
   flickers.push(entry);
-  grp.position.set(x, -0.2, z); // on the table top
+  grp.position.set(x, -0.28, z);
   scene.add(grp);
 }
 
 function buildFireplace() {
   const g = new THREE.Group();
-  const stone = new THREE.MeshStandardMaterial({color: 0x3b3b42, roughness: 0.95});
-  const base = new THREE.Mesh(new THREE.BoxGeometry(2.2, 1.4, 5.5), stone);
-  base.position.y = 0.7;
-  const hood = new THREE.Mesh(new THREE.BoxGeometry(1.6, 7.5, 4.2), stone);
-  hood.position.y = 1.4 + 3.75;
-  const mantel = new THREE.Mesh(new THREE.BoxGeometry(2.5, 0.35, 5.8), stone);
-  mantel.position.y = 2.6;
-  const fireMat = new THREE.MeshBasicMaterial({color: 0xff7a1e});
-  const fire = new THREE.Mesh(new THREE.PlaneGeometry(3.2, 1.5), fireMat);
+  const stone = new THREE.MeshStandardMaterial({ color: 0x3b3b42, roughness: 0.95 });
+  const base = new THREE.Mesh(new THREE.BoxGeometry(2.6, 1.6, 6.5), stone);
+  base.position.y = 0.8;
+  const hood = new THREE.Mesh(new THREE.BoxGeometry(1.8, 9, 4.6), stone);
+  hood.position.y = 1.6 + 4.5;
+  const mantel = new THREE.Mesh(new THREE.BoxGeometry(3.0, 0.4, 6.8), stone);
+  mantel.position.y = 2.9;
+  const fire = new THREE.Mesh(new THREE.PlaneGeometry(4.0, 1.7),
+    new THREE.MeshBasicMaterial({ color: 0xff7a1e, transparent: true, opacity: 0.85, side: THREE.DoubleSide }));
   fire.rotation.y = Math.PI / 2;
-  fire.position.set(1.12, 0.9, 0);
-  const logMat = new THREE.MeshStandardMaterial({color: 0x2a1608, roughness: 1});
-  const log1 = new THREE.Mesh(new THREE.CylinderGeometry(0.16, 0.16, 2.6, 8), logMat);
-  log1.rotation.x = Math.PI / 2;
-  log1.position.set(0.7, 0.25, 0.3);
-  const log2 = log1.clone();
-  log2.position.set(0.7, 0.25, -0.4);
-  g.add(base, hood, mantel, fire, log1, log2);
+  fire.position.set(1.32, 1.0, 0);
+  const logMat = new THREE.MeshStandardMaterial({ color: 0x2a1608, roughness: 1 });
+  const log1 = new THREE.Mesh(new THREE.CylinderGeometry(0.17, 0.17, 3, 8), logMat);
+  log1.rotation.x = Math.PI / 2; log1.position.set(0.8, 0.28, 0.35);
+  const log2 = log1.clone(); log2.position.z = -0.45;
+  const log3 = log1.clone(); log3.position.set(0.4, 0.6, 0);
+  g.add(base, hood, mantel, fire, log1, log2, log3);
   const flames = [];
-  for (const [fz, bx, by] of [[-0.5, 0.9, 1.2], [0.4, 1.1, 1.5]]) {
+  for (const [fz, bx, by] of [[-0.6, 1.0, 1.3], [0.5, 1.2, 1.6], [-1.3, 0.8, 1.1]]) {
     const fl = flameSprite(bx, by);
-    fl.s.position.set(0.75, 1.0, fz);
+    fl.s.position.set(0.85, 1.05, fz);
     g.add(fl.s);
     flames.push(fl);
   }
-  const pl = new THREE.PointLight(0xff6a1a, 60, 42, 2);
-  pl.position.set(3, 1.5, 0);
+  const pl = new THREE.PointLight(0xff6a1a, 70, 40, 2);
+  pl.position.set(3, 1.6, 0);
   g.add(pl);
-  flickers.push({light: pl, base: 60, amp: 18, speed: 7, flames});
-  g.position.set(-16, -6, 0); // on the floor, west side
+  flickers.push({ light: pl, base: 70, amp: 20, speed: 7, flames });
+  g.position.set(-20, -6, 2);
   g.traverse(o => { if (o.isMesh) o.castShadow = true; });
   scene.add(g);
 }
 
-function barrel(x, z, s = 1) {
-  const bmat = new THREE.MeshStandardMaterial({color: 0x6b4423, roughness: 0.8});
-  const b = new THREE.Mesh(new THREE.CylinderGeometry(0.9 * s, 0.75 * s, 1.6 * s, 18), bmat);
-  b.position.set(x, -6 + 0.8 * s, z);
-  b.castShadow = true;
-  scene.add(b);
-  const bandMat = new THREE.MeshStandardMaterial({color: 0x222226, metalness: 0.6, roughness: 0.5});
-  for (const by of [-0.5, 0.5]) {
-    const band = new THREE.Mesh(new THREE.TorusGeometry(0.87 * s, 0.05, 8, 24), bandMat);
-    band.rotation.x = Math.PI / 2;
-    band.position.set(x, -6 + 0.8 * s + by * s, z);
-    scene.add(band);
+// shuttered window letting cool moonlight in
+function window_(x, y, z) {
+  const g = new THREE.Group();
+  const frame = new THREE.MeshStandardMaterial({ color: 0x2f1c0e, roughness: 0.9 });
+  const glass = new THREE.MeshStandardMaterial({
+    color: 0x9fc6ff, emissive: 0x2a4a80, emissiveIntensity: 1.2, roughness: 0.3,
+    transparent: true, opacity: 0.9,
+  });
+  const pane = new THREE.Mesh(new THREE.PlaneGeometry(2.4, 3), glass);
+  pane.rotation.y = Math.PI / 2;
+  g.add(pane);
+  const bar1 = new THREE.Mesh(new THREE.BoxGeometry(0.2, 3.3, 0.16), frame);
+  g.add(bar1);
+  const bar2 = new THREE.Mesh(new THREE.BoxGeometry(0.2, 0.16, 2.7), frame);
+  g.add(bar2);
+  for (const oy of [-1.65, 1.65]) {
+    const shelfM = new THREE.Mesh(new THREE.BoxGeometry(0.5, 0.2, 2.9), frame);
+    shelfM.position.y = oy;
+    g.add(shelfM);
+  }
+  const glow = new THREE.PointLight(0x8fb6ff, 8, 12, 2);
+  glow.position.set(1, 0, 0);
+  g.add(glow);
+  g.position.set(x, y, z);
+  scene.add(g);
+}
+
+function stepFlickers(ft) {
+  for (const f of flickers) {
+    if (f.light) {
+      f.light.intensity = f.base
+        + Math.sin(ft * f.speed) * f.amp * 0.35
+        + Math.sin(ft * f.speed * 2.7 + 1.3) * f.amp * 0.2;
+    }
+    const fs = 1 + 0.1 * Math.sin(ft * 11 + f.speed) + 0.05 * Math.sin(ft * 23 + f.speed * 2);
+    for (const fl of f.flames) fl.s.scale.set(fl.bx * fs, fl.by * (2 - fs), 1);
   }
 }
 
-function mug(x, z) {
-  const g = new THREE.Group();
-  const wood = new THREE.MeshStandardMaterial({color: 0x7a4a1e, roughness: 0.7});
-  const body = new THREE.Mesh(new THREE.CylinderGeometry(0.28, 0.24, 0.55, 16), wood);
-  body.position.y = 0.275;
-  body.castShadow = true;
-  g.add(body);
-  const handle = new THREE.Mesh(new THREE.TorusGeometry(0.18, 0.05, 8, 16, Math.PI), wood);
-  handle.position.set(0.28, 0.3, 0);
-  handle.rotation.z = -Math.PI / 2;
-  g.add(handle);
-  const foam = new THREE.Mesh(
-    new THREE.CylinderGeometry(0.26, 0.26, 0.1, 16),
-    new THREE.MeshStandardMaterial({color: 0xf5ead0, roughness: 0.9})
-  );
-  foam.position.y = 0.58;
-  g.add(foam);
-  g.position.set(x, -0.2, z); // on the table top
-  scene.add(g);
-}
 function seatPos(tileIdx, seat) {
   const { x, z } = tileXZ(tileIdx);
   return new THREE.Vector3(x + SEAT_OFF[seat % 4][0], TILE_TOP, z + SEAT_OFF[seat % 4][1]);
 }
 
-function clearGroup(g) {
-  while (g.children.length) g.remove(g.children[0]);
-}
-
-// owner flag materials, cached per color (all marker materials are shared,
-// so marker rebuilds never leak)
+// ---------------- state rendering ----------------
 const flagMats = new Map();
 function flagMat(color) {
-  if (!flagMats.has(color)) flagMats.set(color, new THREE.MeshStandardMaterial({color, roughness: 0.4}));
+  if (!flagMats.has(color)) flagMats.set(color, new THREE.MeshStandardMaterial({ color, roughness: 0.4 }));
   return flagMats.get(color);
 }
 
@@ -726,25 +1022,28 @@ export function renderBoard3D(state) {
   const sig = JSON.stringify([
     state.board.map(t => [t.ownerId, t.level, t.boost, t.rent]),
     state.round, state.hotelUnlockRound,
-    state.players.map(p => [p.color, p.bankrupt]),
   ]);
   if (sig !== boardSig) {
     boardSig = sig;
     state.board.forEach(t => {
       const owner = state.players.find(p => p.id === t.ownerId) || null;
       const old = tileMeshes[t.index].topMat.map;
-      tileMeshes[t.index].topMat.map = tileTexture(t, owner);
+      const tex = tileTexture(t, owner);
+      // spin the artwork to face the player who reads it
+      tex.center.set(0.5, 0.5);
+      tex.rotation = tileFacing(t.index);
+      tileMeshes[t.index].topMat.map = tex;
       tileMeshes[t.index].topMat.needsUpdate = true;
       if (old) old.dispose();
       const mg = markerGroups[t.index];
       mg.children.forEach(m => { // label sprites own unique textures: free them
         if (m.isSprite) { if (m.material.map) m.material.map.dispose(); m.material.dispose(); }
       });
-      clearGroup(mg);
+      while (mg.children.length) mg.remove(mg.children[0]);
       const { x, z } = tileXZ(t.index);
       for (let h = 0; h < Math.min(t.level, 3); h++) {
         const m = new THREE.Mesh(GEO.house, MAT.house);
-        m.position.set(x - 0.3 + h * 0.3, TILE_TOP + 0.085, z - 0.36);
+        m.position.set(x - 0.3 + h * 0.3, TILE_TOP + 0.085, z - 0.38);
         m.castShadow = true;
         mg.add(m);
       }
@@ -758,36 +1057,32 @@ export function renderBoard3D(state) {
       }
       for (let bIdx = 0; bIdx < t.boost; bIdx++) {
         const m = new THREE.Mesh(GEO.boost, MAT.boost);
-        m.position.set(x - 0.25 + bIdx * 0.25, TILE_TOP + 0.1, z + 0.36);
+        m.position.set(x - 0.25 + bIdx * 0.25, TILE_TOP + 0.1, z + 0.38);
         mg.add(m);
       }
       if (owner) {
         const pole = new THREE.Mesh(GEO.pole, MAT.pole);
-        pole.position.set(x + 0.4, TILE_TOP + 0.27, z + 0.4);
+        pole.position.set(x + 0.42, TILE_TOP + 0.27, z + 0.42);
         const flag = new THREE.Mesh(GEO.flag, flagMat(owner.color));
-        flag.position.set(x + 0.4, TILE_TOP + 0.58, z + 0.4);
+        flag.position.set(x + 0.42, TILE_TOP + 0.58, z + 0.42);
         mg.add(pole, flag);
       }
-      const plate = labelSprite(t, owner); // camera-facing name plate
-      plate.visible = platesVisible;
+      const plate = labelSprite(t, owner);
       mg.add(plate);
       plateSprites[t.index] = plate;
     });
+    updatePlateFade();
   }
-  const csig = `${state.round}|${state.hotelUnlockRound}|${state.constants.resortTiles.join(',')}`;
-  if (csig !== centerSig) {
-    centerSig = csig;
-    if (centerMesh) {
-      scene.remove(centerMesh);
-      centerMesh.material.map.dispose();
-      centerMesh.material.dispose();
-    }
+  // the centre logo is static, so it is built once and never rebuilt
+  if (!centerMesh) {
     centerMesh = new THREE.Mesh(
-      new THREE.PlaneGeometry(5.4, 5.4),
-      new THREE.MeshStandardMaterial({ map: centerTexture(state), roughness: 0.9 })
+      new THREE.PlaneGeometry(6.4, 6.4),
+      new THREE.MeshStandardMaterial({ map: centerTexture(), roughness: 0.9 })
     );
-    centerMesh.rotation.x = -Math.PI / 2;
-    centerMesh.position.y = 0.005;
+    // face up, and spin the artwork so it reads the right way round from the
+    // default (south) seat
+    centerMesh.rotation.set(-Math.PI / 2, 0, Math.PI);
+    centerMesh.position.y = 0.02;
     centerMesh.receiveShadow = true;
     scene.add(centerMesh);
   }
@@ -798,8 +1093,7 @@ export function renderBoard3D(state) {
     state.players.forEach((p, s) => {
       const g = tokenMeshes[s];
       g.visible = true;
-      const pos = seatPos(p.position, s);
-      g.position.copy(pos);
+      g.position.copy(seatPos(p.position, s));
       const mat = g.userData.mat;
       mat.color.set(p.bankrupt ? 0x64748b : p.color);
       mat.emissive.set(p.bankrupt ? 0x000000 : p.color);
@@ -809,28 +1103,25 @@ export function renderBoard3D(state) {
     });
     for (let s = state.players.length; s < 4; s++) tokenMeshes[s].visible = false;
   }
-  // name-tag textures only change with roster/color/bankruptcy, not movement
-  const tsig = JSON.stringify(state.players.map(p => [p.name, p.color, p.bankrupt]));
-  if (tsig !== tagSig) {
-    tagSig = tsig;
-    state.players.forEach((p, s) => {
-      const tag = tokenTags[s];
-      const old = tag.material.map;
-      tag.material.map = rectTex(256, 80, (ctx, W, H) => {
-        ctx.clearRect(0, 0, W, H);
-        ctx.fillStyle = p.bankrupt ? 'rgba(71,85,105,0.92)' : p.color;
-        rr(ctx, 2, 2, W - 4, H - 4, 26);
-        ctx.fill();
-        ctx.fillStyle = '#fff';
-        ctx.textAlign = 'center';
-        ctx.font = 'bold 44px system-ui,sans-serif';
-        ctx.fillText((p.bankrupt ? '💀 ' : '') + p.name.slice(0, 10), W / 2, 55);
-      });
-      tag.material.needsUpdate = true;
-      if (old) old.dispose();
-    });
-  }
-  updateRoster3D(state); // corner name+money panels
+  // characters: name plates + whose turn it is
+  mySeat = state.players.findIndex(p => p.id === UI?.myPlayerId);
+  setCharActive(chars, state.status === 'playing' ? currentSeat : -1);
+  state.players.forEach((p, s) => updateCharTag(chars[s], p.name, p.color, p.money, p.bankrupt));
+  for (let s = state.players.length; s < 4; s++) updateCharTag(chars[s], 'OPEN SEAT', '#475569', 0, false);
+  // gold ring on the pawn you control
+  chars.forEach((c, s) => { c.highlight = s === mySeat ? 1 : 0; });
+}
+
+// seat index of the local player (or -1 while spectating the lobby)
+export function getMySeat3D() { return mySeat; }
+
+// Watch a specific character: seats camera onto them and turns their head
+// toward whatever the camera is doing.
+export function watchSeat3D(seat) {
+  setViewSeat3D(seat);
+  if (CAM.mode === 'seat') return seat;
+  orbitAroundSeat(seat, false);
+  return seat;
 }
 
 export function setCursor3D(i) {
@@ -840,7 +1131,7 @@ export function setCursor3D(i) {
   if (i !== null && tileMeshes[i]) tileMeshes[i].topMat.emissive.setHex(0x554400);
 }
 
-// ---------- animations ----------
+// ---------------- animations ----------------
 export async function animateSteps3D(seat, path) {
   if (!ready || !path.length) return;
   tokenLock = true;
@@ -850,13 +1141,14 @@ export async function animateSteps3D(seat, path) {
     setCursor3D(tile);
     const from = g.position.clone();
     const to = seatPos(tile, seat);
-    await tween(0.13, k => {
+    await tween(0.12, k => {
       g.position.lerpVectors(from, to, k);
       g.position.y = TILE_TOP + Math.sin(Math.PI * k) * 0.38;
     });
   }
   setCursor3D(null);
   tokenLock = false;
+  hopChar(seat);
 }
 
 export async function animateFly3D(seat, fromTile, toTile) {
@@ -874,10 +1166,17 @@ export async function animateFly3D(seat, fromTile, toTile) {
   });
   setCursor3D(null);
   tokenLock = false;
+  hopChar(seat);
+}
+
+// little fist-pump on the character whose pawn just moved
+function hopChar(seat) {
+  const c = chars[seat];
+  if (!c) return;
+  c.bounce = 1;
 }
 
 // Dice materials are [+x, -x, +y, -y, +z, -z]; faces hold [1, 6, 2, 5, 3, 4].
-// Rotate so the rolled value ends on top (+y), plus a random y-spin.
 function finalDiceEuler(v, spin) {
   switch (v) {
     case 1: return new THREE.Euler(0, spin, Math.PI / 2, 'YXZ');
@@ -892,11 +1191,20 @@ function finalDiceEuler(v, spin) {
 export async function showDice3D(d1, d2) {
   if (!ready) return;
   const vals = [d1, d2];
+  // in first person, toss the dice right in front of the player
+  const spot = CAM.mode === 'seat' ? SEAT_SPOTS[CAM.seat] : null;
+  const fwd = spot ? new THREE.Vector3(Math.sin(spot.yaw), 0, Math.cos(spot.yaw)) : null;
   const jobs = diceMeshes.map((m, k) => {
     const v = vals[k];
     m.material.forEach(f => { f.map = m.userData.pips[v - 1]; f.needsUpdate = true; });
-    const end = new THREE.Vector3(-0.7 + k * 1.4 + (Math.random() - 0.5) * 0.3, 0.23, (Math.random() - 0.5) * 1.6);
-    const start = new THREE.Vector3(end.x * 0.4, 4.5 + k, end.z * 0.4);
+    // seated players get the dice thrown right in front of them
+    const land = fwd
+      ? new THREE.Vector3(
+          spot.x + fwd.x * 3.4 + (k - 0.5) * 1.2,
+          TILE_TOP + 0.23,
+          spot.z + fwd.z * 3.4)
+      : new THREE.Vector3(-0.7 + k * 1.4 + (Math.random() - 0.5) * 0.3, TILE_TOP + 0.23, (Math.random() - 0.5) * 1.6);
+    const start = new THREE.Vector3(land.x * 0.5, 5.2 + k, land.z * 0.5);
     const e0 = new THREE.Euler(Math.random() * 6, Math.random() * 6, Math.random() * 6);
     const e1 = finalDiceEuler(v, Math.random() * Math.PI * 2);
     const q0 = new THREE.Quaternion().setFromEuler(e0);
@@ -906,7 +1214,7 @@ export async function showDice3D(d1, d2) {
     const spins = 2 + Math.floor(Math.random() * 2);
     return tween(0.9, t => {
       const e = 1 - Math.pow(1 - t, 3);
-      m.position.lerpVectors(start, end, e);
+      m.position.lerpVectors(start, land, e);
       m.position.y += Math.sin(Math.PI * Math.min(1, t * 1.15)) * 0.9 * (1 - t);
       const q = new THREE.Quaternion().slerpQuaternions(q0, q1, e);
       const extra = new THREE.Quaternion().setFromAxisAngle(new THREE.Vector3(0, 1, 0), (1 - e) * spins * Math.PI * 2);
@@ -914,60 +1222,75 @@ export async function showDice3D(d1, d2) {
     });
   });
   await Promise.all(jobs);
-  showSum3D(d1, d2); // short-lived floating total once the dice settle
-  await wait(900);
+  UI?.showSum?.(d1 + d2, d1 === d2);
+  await wait(850);
   diceMeshes.forEach(m => { m.visible = false; });
 }
 
-// Short-lived floating dice total ("7", gold + DOUBLES! on doubles).
-// Rides the existing floaters pipeline: rises, fades, disposes itself.
-function showSum3D(d1, d2) {
-  if (!ready) return;
-  const sum = d1 + d2, dbl = d1 === d2;
-  const tex = rectTex(512, 256, (ctx, W, H) => {
-    ctx.clearRect(0, 0, W, H);
-    ctx.textAlign = 'center';
-    ctx.font = 'bold 150px system-ui,sans-serif';
-    ctx.lineWidth = 14;
-    ctx.strokeStyle = 'rgba(2,6,23,0.9)';
-    ctx.strokeText(`${sum}`, W / 2, 158);
-    ctx.fillStyle = dbl ? '#fbbf24' : '#ffffff';
-    ctx.fillText(`${sum}`, W / 2, 158);
-    ctx.font = 'bold 44px system-ui,sans-serif';
-    ctx.fillStyle = '#cbd5e1';
-    ctx.fillText(dbl ? 'DOUBLES!' : 'total', W / 2, 218);
-  });
-  const sp = new THREE.Sprite(new THREE.SpriteMaterial({map: tex, transparent: true, depthTest: false}));
-  sp.scale.set(2.2, 1.1, 1);
-  sp.renderOrder = 1002;
-  sp.position.set(0, 1.1, UI_Z);
-  uiRoot.add(sp);
-  floaters.push({sprite: sp, seat: -1, y0: 1.1, start: performance.now(), dur: 1300});
+// ---------------- celebration ----------------
+let confetti = [];
+let confettiMesh = null;
+function stepConfetti(dt) {
+  if (!confettiMesh) return;
+  const attr = confettiMesh.geometry.attributes.position;
+  const arr = attr.array;
+  let alive = 0;
+  for (const p of confetti) {
+    if (p.life <= 0) continue;
+    p.life -= dt;
+    p.vy -= 2.4 * dt;
+    p.x += p.vx * dt; p.y += p.vy * dt; p.z += p.vz * dt;
+    if (p.y < FLOOR_Y + 0.1) p.life = 0;
+    const i = p.i * 3;
+    arr[i] = p.x; arr[i + 1] = p.y; arr[i + 2] = p.z;
+    alive++;
+  }
+  attr.needsUpdate = true;
+  confettiMesh.material.opacity = Math.min(0.95, alive / 40);
+  confettiMesh.visible = alive > 0;
+  if (!alive) { confetti = []; scene.remove(confettiMesh); confettiMesh.geometry.dispose(); confettiMesh.material.dispose(); confettiMesh = null; }
 }
 
-// ================= in-3D UI: HUD action bar + modal dialogs =================
-// Everything is attached to the camera so it stays readable while orbiting.
-const ISLAND_TILE = 7;
-const UI_Z = -7;            // camera-space depth of all UI
-let uiRoot = null, hudGroup = null, dlgGroup = null;
-let rosterGroup = null;       // corner money/name panels, one per player
-let rosterPanels = [];        // {mesh, seat}
-let rosterSig = '';
-let rosterCount = 0;
-let hudY = -2.62;
-let rosterGameId = null;
-let rosterMoney = [null, null, null, null]; // last seen cash per seat
-let moneyFx = [];             // panel flash+pop: {seat, tint, start}
-let floaters = [];            // rising delta tickers: {sprite, seat, y0, start, dur}
-const WHITE_TMP = new THREE.Color(0xffffff);
-let hudBtns = [];           // {id, mesh, enabled}
-let dlgBtns = [];           // {id, mesh, enabled}
-let dlgResolve = null;
-let hudCb = null;
-let targeting = false;
+// Winner confetti burst + the winning character throws their arms up.
+export function celebrate3D(seat, color = '#fbbf24') {
+  if (!ready || seat < 0) return;
+  const c = chars[seat];
+  if (c) {
+    c.bounce = 1;
+    c.cheer = 4;
+  }
+  // pull the camera up so the winner and the confetti are both in frame
+  if (CAM.mode === 'seat' && CAM.seat === seat) {
+    CAM.zoom = Math.max(CAM.zoom, 0.7);
+    CAM.pitch = 0.16;
+  }
+  const N = 260;
+  const pos = new Float32Array(N * 3);
+  const col = new Float32Array(N * 3);
+  const base = new THREE.Color(color);
+  confetti = [];
+  for (let i = 0; i < N; i++) {
+    const a = Math.random() * Math.PI * 2, s = 1 + Math.random() * 3;
+    const x = c ? c.outer.position.x : 0, z = c ? c.outer.position.z : 0;
+    const y = SEAT_EYE + 2;
+    pos.set([x, y + Math.random() * 3, z], i * 3);
+    const tint = base.clone().offsetHSL((Math.random() - 0.5) * 0.2, 0, (Math.random() - 0.5) * 0.3);
+    col.set([tint.r, tint.g, tint.b], i * 3);
+    confetti.push({ i, x, y: y + Math.random() * 3, z, vx: Math.cos(a) * s, vy: 2 + Math.random() * 3, vz: Math.sin(a) * s, life: 3.5 });
+  }
+  const geo = new THREE.BufferGeometry();
+  geo.setAttribute('position', new THREE.BufferAttribute(pos, 3));
+  geo.setAttribute('color', new THREE.BufferAttribute(col, 3));
+  confettiMesh = new THREE.Points(geo, new THREE.PointsMaterial({
+    size: 0.14, vertexColors: true, transparent: true, opacity: 0.95, depthWrite: false,
+  }));
+  confettiMesh.frustumCulled = false;
+  scene.add(confettiMesh);
+}
 
-export function onHUDClick3D(cb) { hudCb = cb; }
-export function isDialogOpen3D() { return dlgResolve !== null; }
+// ---------------- fly-targeting ----------------
+const ISLAND_TILE = 7;
+let targeting = false;
 export function setTargeting3D(on) {
   targeting = on;
   if (!ready) return;
@@ -975,407 +1298,50 @@ export function setTargeting3D(on) {
   else tileMeshes.forEach(t => { t.topMat.emissive.setHex(0x000000); t.topMat.emissiveIntensity = 1; });
 }
 
-function rectTex(w, h, draw) {
-  const c = document.createElement('canvas');
-  c.width = w; c.height = h;
-  draw(c.getContext('2d'), w, h);
-  const t = new THREE.CanvasTexture(c);
-  t.colorSpace = THREE.SRGBColorSpace;
-  t.anisotropy = 4;
-  return t;
+// ---------------- UI bridge ----------------
+export function attachUI(api) { UI = api; }
+
+// ---------------- debug / test hooks ----------------
+export function debugState3D() {
+  return {
+    objects: scene ? scene.children.length : -1,
+    chars: chars.length,
+    mode: CAM.mode,
+    seat: CAM.seat,
+    viewSeat: CAM.seat,
+    plates: platesVisible,
+    celebrating: !!confettiMesh,
+    logOpen: UI?.logOpen?.() ?? null,
+    textures: renderer ? renderer.info.memory.textures : -1,
+    geometries: renderer ? renderer.info.memory.geometries : -1,
+    programs: renderer ? renderer.info.programs?.length ?? 0 : -1,
+    tiles: tileMeshes.length,
+    tokens: tokenMeshes.length,
+    chars3d: chars.map(c => ({
+      seat: c.seat, headYaw: +c.headYaw.toFixed(3), headPitch: +c.headPitch.toFixed(3),
+      ringOpacity: +c.ring.material.opacity.toFixed(3), active: !!c.active,
+    })),
+  };
 }
-
-function rr(ctx, x, y, w, h, r) {
-  ctx.beginPath();
-  ctx.moveTo(x + r, y);
-  ctx.arcTo(x + w, y, x + w, y + h, r);
-  ctx.arcTo(x + w, y + h, x, y + h, r);
-  ctx.arcTo(x, y + h, x, y, r);
-  ctx.arcTo(x, y, x + w, y, r);
-  ctx.closePath();
-}
-
-// A clickable 3D button, width fitted to its label. Returns {mesh, w, h}.
-function makeUIButton(label, sub, enabled, accent, h = 0.5) {
-  const fs = 46;
-  const meas = document.createElement('canvas').getContext('2d');
-  meas.font = `bold ${fs}px system-ui,sans-serif`;
-  const tw = meas.measureText(label.slice(0, 26)).width;
-  meas.font = '30px system-ui,sans-serif';
-  const sw = sub ? meas.measureText(sub.slice(0, 34)).width : 0;
-  const W = Math.ceil(Math.min(560, Math.max(tw, sw) + 96));
-  const H = sub ? 132 : 100;
-  const tex = rectTex(W, H, (ctx) => {
-    ctx.clearRect(0, 0, W, H);
-    rr(ctx, 3, 3, W - 6, H - 6, 22);
-    ctx.fillStyle = enabled ? (accent || '#22c55e') : '#334155';
-    ctx.fill();
-    ctx.fillStyle = enabled ? '#06240f' : '#94a3b8';
-    ctx.textAlign = 'center';
-    ctx.font = `bold ${fs}px system-ui,sans-serif`;
-    ctx.fillText(label.slice(0, 26), W / 2, sub ? 60 : 68);
-    if (sub) {
-      ctx.font = '30px system-ui,sans-serif';
-      ctx.fillStyle = enabled ? '#052e16' : '#64748b';
-      ctx.fillText(sub.slice(0, 34), W / 2, 104);
-    }
-  });
-  const w = h * (W / H);
-  const mesh = new THREE.Mesh(
-    new THREE.PlaneGeometry(w, h),
-    new THREE.MeshBasicMaterial({ map: tex, transparent: true, depthTest: false })
-  );
-  mesh.renderOrder = 1000;
-  mesh.userData.isUI = true;
-  return { mesh, w, h, tex };
-}
-
-function clearUIGroup(g) {
-  while (g.children.length) {
-    const m = g.children.pop();
-    // UI meshes own unique geometry/material/texture -> dispose all
-    if (m.geometry) m.geometry.dispose();
-    if (m.material) {
-      if (m.material.map) m.material.map.dispose();
-      m.material.dispose();
-    }
-  }
-}
-
-// HUD: single contextual action row at the bottom of the view.
-let lastHUDDefs = [];
-export function updateHUD3D(defs) {
-  if (!ready) return;
-  lastHUDDefs = defs;
-  clearUIGroup(hudGroup);
-  hudBtns = [];
-  for (const d of defs) {
-    const b = makeUIButton(d.label, d.sub || '', d.enabled !== false, d.accent, 0.46);
-    b.mesh.userData.hudId = d.id;
-    b.mesh.userData.enabled = d.enabled !== false;
-    hudGroup.add(b.mesh);
-    hudBtns.push({ id: d.id, mesh: b.mesh, enabled: b.mesh.userData.enabled, w: b.w, h: b.h });
-  }
-  layoutHUD();
-}
-
-function layoutHUD() {
-  if (!ready || !hudGroup || !hudBtns.length) return;
-  const gap = 0.12;
-  const total = hudBtns.reduce((s, b) => s + b.w, 0) + gap * (hudBtns.length - 1);
-  let x = -total / 2;
-  for (const b of hudBtns) {
-    b.mesh.position.set(x + b.w / 2, hudY, UI_Z);
-    x += b.w + gap;
-  }
-  // shrink to fit narrow windows
-  const visW = 2 * Math.abs(UI_Z) * Math.tan(THREE.MathUtils.degToRad(camera.fov / 2)) * camera.aspect;
-  hudGroup.scale.setScalar(Math.min(1, (visW * 0.96) / total));
-}
-
-// ---- corner roster: name + money per player (seats 0-3 -> corners) ----
-function rosterTexture(p, isCurrent, mode) {
-  return rectTex(512, 208, (ctx, W, H) => {
-    ctx.clearRect(0, 0, W, H);
-    ctx.fillStyle = 'rgba(2,6,23,0.88)';
-    rr(ctx, 4, 4, W - 8, H - 8, 34);
-    ctx.fill();
-    ctx.lineWidth = isCurrent ? 10 : 5;
-    ctx.strokeStyle = isCurrent ? '#fbbf24' : '#334155';
-    rr(ctx, 8, 8, W - 16, H - 16, 28);
-    ctx.stroke();
-    ctx.fillStyle = p.bankrupt ? '#475569' : p.color;
-    rr(ctx, 22, 22, 26, H - 44, 13);
-    ctx.fill();
-    ctx.textAlign = 'left';
-    ctx.fillStyle = p.bankrupt ? '#94a3b8' : '#fff';
-    ctx.font = 'bold 50px system-ui,sans-serif';
-    const status = `${isCurrent ? '👉' : ''}${p.inJail ? '🏝️' : ''}${p.tourPending ? '✈️' : ''}${p.bankrupt ? '💀' : ''}`;
-    ctx.fillText(`${status}${p.name.slice(0, 10)}`, 64, 84);
-    ctx.fillStyle = '#4ade80';
-    ctx.font = 'bold 56px system-ui,sans-serif';
-    ctx.fillText(`$${p.money}`, 64, 158);
-    ctx.fillStyle = '#94a3b8';
-    ctx.font = '32px system-ui,sans-serif';
-    ctx.fillText(`net $${p.netWorth}${mode === 'team' ? ` · T${p.team + 1}` : ''}`, 64, 192);
-  });
-}
-
-function updateRoster3D(state) {
-  if (state.id !== rosterGameId) { // fresh game: learn balances silently
-    rosterGameId = state.id;
-    rosterMoney = state.players.map(p => p.money);
-  }
-  // detect cash deltas BEFORE the texture rebuild below
-  const deltas = state.players.map((p, s) => {
-    const old = rosterMoney[s];
-    rosterMoney[s] = p.money;
-    return (old === null || old === undefined || old === p.money) ? 0 : p.money - old;
-  });
-  const sig = JSON.stringify(state.players.map(p =>
-    [p.name, p.color, p.money, p.netWorth, p.bankrupt, p.inJail, p.tourPending, p.team,
-     state.currentPlayerId === p.id, state.mode]));
-  if (sig !== rosterSig) {
-    rosterSig = sig;
-    while (rosterGroup.children.length) {
-      const m = rosterGroup.children.pop();
-      if (m.geometry) m.geometry.dispose();
-      if (m.material) { if (m.material.map) m.material.map.dispose(); m.material.dispose(); }
-    }
-    rosterPanels = [];
-    state.players.forEach((p, s) => {
-      const mesh = new THREE.Mesh(
-        new THREE.PlaneGeometry(2.3, 2.3 * 208 / 512),
-        new THREE.MeshBasicMaterial({
-          map: rosterTexture(p, state.currentPlayerId === p.id, state.mode),
-          transparent: true, depthTest: false,
-        })
-      );
-      mesh.renderOrder = 1000;
-      mesh.userData.isUI = true;
-      rosterGroup.add(mesh);
-      rosterPanels.push({mesh, seat: s});
-    });
-  }
-  rosterCount = state.players.length;
-  hudY = rosterCount > 2 ? -1.85 : -2.62; // lift HUD when bottom corners are taken
-  layoutRoster();
-  layoutHUD();
-  // eye candy: flash+pop the panel and float a +/- ticker for every change
-  deltas.forEach((d, s) => { if (d !== 0) spawnMoneyFx(s, d); });
-}
-
-// Rising "+$200" / "-$50" ticker anchored to a roster panel, plus panel flash+pop.
-function spawnMoneyFx(seat, delta) {
-  if (!ready) return;
-  const panel = rosterPanels.find(r => r.seat === seat);
-  const gain = delta > 0;
-  const tex = rectTex(512, 128, (ctx, W, H) => {
-    ctx.clearRect(0, 0, W, H);
-    ctx.textAlign = 'center';
-    ctx.font = 'bold 84px system-ui,sans-serif';
-    const s = `${gain ? '+' : ''}$${delta}`;
-    ctx.lineWidth = 12;
-    ctx.strokeStyle = 'rgba(2,6,23,0.9)';
-    ctx.strokeText(s, W / 2, 94);
-    ctx.fillStyle = gain ? '#4ade80' : '#f87171';
-    ctx.fillText(s, W / 2, 94);
-  });
-  const sp = new THREE.Sprite(new THREE.SpriteMaterial({map: tex, transparent: true, depthTest: false}));
-  sp.scale.set(1.7, 1.7 * 128 / 512, 1);
-  sp.renderOrder = 1001;
-  const stack = floaters.filter(f => f.seat === seat).length;
-  const base = panel ? panel.mesh.position : new THREE.Vector3(0, 2.2, UI_Z);
-  sp.position.set(base.x, base.y + 0.75 + stack * 0.4, UI_Z);
-  uiRoot.add(sp);
-  floaters.push({sprite: sp, seat, y0: sp.position.y, start: performance.now(), dur: 1400});
-  moneyFx.push({seat, tint: gain ? 0x4ade80 : 0xf87171, start: performance.now()});
-}
-
-export function setPlatesVisible3D(v) {
-  platesVisible = v;
-  if (!ready) return;
-  for (const sp of plateSprites) if (sp) sp.visible = v;
-}
-
-function layoutRoster() {
-  if (!ready || !rosterGroup) return;
-  const hh = Math.abs(UI_Z) * Math.tan(THREE.MathUtils.degToRad(camera.fov / 2));
-  const hw = hh * camera.aspect;
-  // seats 0..3 -> TL, TR, BL, BR
-  const spots = [[-1, 1], [1, 1], [-1, -1], [1, -1]];
-  for (const {mesh, seat} of rosterPanels) {
-    const [sx, sy] = spots[seat % 4];
-    mesh.position.set(sx * (hw - 1.15 - 0.22), sy * (hh - 0.47 - 0.22), UI_Z);
-  }
-}
-
-// Dialog engine: title + optional big text + body lines + option buttons.
-export function openDialog3D(spec) {
-  if (!ready) return Promise.resolve(null);
-  if (dlgResolve) { const r = dlgResolve; dlgResolve = null; try { r(null); } catch {} } // replace stale dialog
-  controls.enabled = false;
-  hudGroup.visible = false;
-  return new Promise(resolve => { dlgResolve = resolve; buildDialog(spec); });
-}
-
-function buildDialog(spec) {
-  clearUIGroup(dlgGroup);
-  dlgGroup.userData.step = null;
-  dlgBtns = [];
-  const lines = (spec.lines || []).slice(0, 7);
-  const titleH = 120, bigH = spec.big ? 200 : 0, lineH = 46;
-  const pad = 50;
-  const CH = Math.min(1024, titleH + bigH + lines.length * lineH + pad);
-  const tex = rectTex(1024, CH, (ctx, W, H) => {
-    ctx.fillStyle = 'rgba(30,41,59,0.97)';
-    rr(ctx, 4, 4, W - 8, H - 8, 36);
-    ctx.fill();
-    ctx.strokeStyle = '#fbbf24';
-    ctx.lineWidth = 6;
-    rr(ctx, 10, 10, W - 20, H - 20, 30);
-    ctx.stroke();
-    ctx.textAlign = 'center';
-    ctx.fillStyle = '#fff';
-    ctx.font = 'bold 68px system-ui,sans-serif';
-    ctx.fillText((spec.title || '').slice(0, 30), W / 2, 88);
-    let y = titleH;
-    if (spec.big) {
-      ctx.font = '150px system-ui,sans-serif';
-      ctx.fillText(spec.big.slice(0, 12), W / 2, y + 150);
-      y += bigH;
-    }
-    ctx.fillStyle = '#cbd5e1';
-    ctx.font = '36px system-ui,sans-serif';
-    for (const ln of lines) { y += lineH; ctx.fillText(String(ln).slice(0, 52), W / 2, y); }
-  });
-  const panelW = 5.6, panelH = panelW * (CH / 1024);
-  const panel = new THREE.Mesh(
-    new THREE.PlaneGeometry(panelW, panelH),
-    new THREE.MeshBasicMaterial({ map: tex, transparent: true, depthTest: false })
-  );
-  panel.renderOrder = 1000;
-  dlgGroup.add(panel);
-
-  const opts = spec.options || [];
-  const gap = 0.1;
-  const btnHs = opts.map(o => 0.55);
-  const btnsH = btnHs.reduce((s, h) => s + h + gap, 0);
-  const totalH = panelH + 0.25 + btnsH;
-  panel.position.set(0, totalH / 2 - panelH / 2 + 0.35, UI_Z);
-  let y = totalH / 2 - panelH - 0.25 + 0.35;
-  opts.forEach((o, k) => {
-    const b = makeUIButton(o.label, o.sub || o.reason || '', !o.disabled, o.accent, btnHs[k]);
-    b.mesh.position.set(0, y - btnHs[k] / 2, UI_Z);
-    y -= btnHs[k] + gap;
-    b.mesh.userData.dlgId = o.id;
-    b.mesh.userData.enabled = !o.disabled;
-    dlgGroup.add(b.mesh);
-    dlgBtns.push({ id: o.id, mesh: b.mesh, enabled: !o.disabled });
-  });
-  dlgGroup.position.set(0, 0, 0);
-}
-
-export function closeDialog3D(result) {
-  if (!ready) return;
-  const r = dlgResolve;
-  dlgResolve = null;
-  dlgBtns = [];
-  dlgGroup.userData.step = null;
-  clearUIGroup(dlgGroup);
-  hudGroup.visible = true;
-  controls.enabled = true;
-  if (r) { try { r(result ?? null); } catch {} }
-}
-
-// Custom-dice picker: steppers for d1/d2 + confirm. Resolves {d1,d2} | null.
-const PICK_FACES = ['', '⚀', '⚁', '⚂', '⚃', '⚄', '⚅'];
-export function openDicePick3D() {
-  if (!ready) return Promise.resolve(null);
-  if (dlgResolve) closeDialog3D(null);
-  controls.enabled = false;
-  hudGroup.visible = false;
-  let d1 = 3, d2 = 4;
-  return new Promise(resolve => {
-    dlgResolve = resolve;
-    // stepper layout: d1 pair left, d2 pair right, confirm/cancel below
-    const redraw = () => {
-      clearUIGroup(dlgGroup);
-      dlgBtns = [];
-      const tex = rectTex(1024, 420, (ctx, W, H) => {
-        ctx.fillStyle = 'rgba(30,41,59,0.97)';
-        rr(ctx, 4, 4, W - 8, H - 8, 36); ctx.fill();
-        ctx.strokeStyle = '#fbbf24'; ctx.lineWidth = 6;
-        rr(ctx, 10, 10, W - 20, H - 20, 30); ctx.stroke();
-        ctx.textAlign = 'center'; ctx.fillStyle = '#fff';
-        ctx.font = 'bold 68px system-ui,sans-serif';
-        ctx.fillText('⚙️ Custom die', W / 2, 88);
-        ctx.font = '150px system-ui,sans-serif';
-        ctx.fillText(`${PICK_FACES[d1]} ${PICK_FACES[d2]}`, W / 2, 260);
-        ctx.fillStyle = '#cbd5e1'; ctx.font = '36px system-ui,sans-serif';
-        ctx.fillText(`move exactly ${d1 + d2} tiles`, W / 2, 330);
-        ctx.fillText(`d1 = ${d1}      d2 = ${d2}`, W / 2, 380);
-      });
-      const panel = new THREE.Mesh(
-        new THREE.PlaneGeometry(5.6, 5.6 * (420 / 1024)),
-        new THREE.MeshBasicMaterial({ map: tex, transparent: true, depthTest: false })
-      );
-      panel.renderOrder = 1000;
-      dlgGroup.add(panel);
-      const opts = [
-        { id: 'd1-', label: 'd1 −' }, { id: 'd1+', label: 'd1 +' },
-        { id: 'd2-', label: 'd2 −' }, { id: 'd2+', label: 'd2 +' },
-        { id: 'ok', label: `▶ Roll ${d1 + d2}`, accent: '#22c55e' },
-        { id: 'cancel', label: 'Cancel', accent: '#475569' },
-      ];
-      // two columns for steppers, full-width confirm/cancel
-      const y0 = 0.4, rowH = 0.62;
-      const put = (o, x, y, wScale) => {
-        const b = makeUIButton(o.label, '', true, o.accent);
-        if (wScale && wScale !== 1) { b.mesh.scale.x = wScale; }
-        b.mesh.position.set(x, y, UI_Z);
-        b.mesh.userData.dlgId = o.id;
-        b.mesh.userData.enabled = true;
-        dlgGroup.add(b.mesh);
-        dlgBtns.push({ id: o.id, mesh: b.mesh, enabled: true });
-      };
-      panel.position.set(0, 1.55, UI_Z);
-      put(opts[0], -1.7, -0.75); put(opts[1], -0.1, -0.75);
-      put(opts[2], 1.7, -0.75); put(opts[3], 3.1 - 1.7 + 1.7, -0.75);
-      put(opts[4], 0, -1.47); put(opts[5], 0, -2.19);
-    };
-    const step = id => {
-      if (id === 'd1-') d1 = d1 > 1 ? d1 - 1 : 6;
-      else if (id === 'd1+') d1 = d1 < 6 ? d1 + 1 : 1;
-      else if (id === 'd2-') d2 = d2 > 1 ? d2 - 1 : 6;
-      else if (id === 'd2+') d2 = d2 < 6 ? d2 + 1 : 1;
-      else if (id === 'ok') { closeDialog3D({ d1, d2 }); return; }
-      else { closeDialog3D(null); return; }
-      redraw();
-    };
-    dlgGroup.userData.step = step;
-    redraw();
-  });
-}
-
-// ---- pointer routing: dialog buttons > HUD buttons > tiles ----
-function ptrNDC(e) {
+export function getCameraObject3D() { return camera; }
+export function getSceneObject3D() { return scene; }
+export function getChars3D() { return chars; }
+export function getCameraPos3D() { return camera.position.toArray(); }
+// project a tile centre to screen pixels (for automated clicks)
+export function tileScreenPos3D(idx) {
+  const { x, z } = tileXZ(idx);
+  const v = new THREE.Vector3(x, TILE_TOP, z).project(camera);
   const r = renderer.domElement.getBoundingClientRect();
-  return new THREE.Vector2(
-    ((e.clientX - r.left) / r.width) * 2 - 1,
-    -((e.clientY - r.top) / r.height) * 2 + 1
-  );
+  return { x: r.left + (v.x * 0.5 + 0.5) * r.width, y: r.top + (-v.y * 0.5 + 0.5) * r.height };
 }
-
-function routeUIClick(e) {
-  if (!ready) return false;
-  raycaster.setFromCamera(ptrNDC(e), camera);
-  if (dlgResolve) {
-    const hit = raycaster.intersectObjects(dlgBtns.map(b => b.mesh))[0];
-    if (hit && hit.object.userData.enabled) {
-      const id = hit.object.userData.dlgId;
-      if (dlgGroup.userData.step && id.startsWith('d')) { dlgGroup.userData.step(id); }
-      else { dlgGroup.userData.step = null; closeDialog3D(id); }
-    }
-    return true; // dialog eats all clicks
-  }
-  const hit = raycaster.intersectObjects(hudBtns.map(b => b.mesh))[0];
-  if (hit && hit.object.userData.enabled && hudCb) {
-    hudCb(hit.object.userData.hudId);
-    return true;
-  }
-  return false;
+// project any world object to screen pixels (used by the e2e harness)
+export function projectToScreen3D(obj) {
+  obj.updateWorldMatrix(true, false);   // fresh transforms after a UI rebuild
+  const v = new THREE.Vector3().setFromMatrixPosition(obj.matrixWorld).project(camera);
+  const r = renderer.domElement.getBoundingClientRect();
+  return { x: r.left + (v.x * 0.5 + 0.5) * r.width, y: r.top + (-v.y * 0.5 + 0.5) * r.height };
 }
-
-function routeUIHover(e) {
-  if (!ready) return;
-  raycaster.setFromCamera(ptrNDC(e), camera);
-  let list = dlgResolve ? dlgBtns : hudBtns;
-  const hit = raycaster.intersectObjects(list.map(b => b.mesh))[0];
-  renderer.domElement.style.cursor = hit && hit.object.userData.enabled ? 'pointer' : '';
-  const scaleAll = (arr, id) => arr.forEach(b => {
-    const on = hit && hit.object === b.mesh && b.enabled;
-    b.mesh.scale.setScalar(on ? 1.1 : 1);
-  });
-  scaleAll(dlgResolve ? dlgBtns : hudBtns);
+export function charScreenPos3D(seat) {
+  const c = chars[seat];
+  return c ? projectToScreen3D(c.outer) : null;
 }
